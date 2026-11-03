@@ -29,7 +29,9 @@ UNITS=(
   media-analytics-service.service contents-analysis-service.service
   # Broadcast data service (Ginga + its Java middleware). No antenna channels
   # are tuned on this set; data-service autorun is also off in settings.
-  gingancl.service org.tizen.javamw.service
+  # The busname must go first: stopping the service alone leaves D-Bus able to
+  # re-activate it (systemd warns about exactly this on the stop).
+  com.samsung.gingancl.gingancl.busname gingancl.service org.tizen.javamw.service
   # SmartThings device agent.
   ifw-thing.service
 )
