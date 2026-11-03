@@ -46,8 +46,18 @@ make -C mgl                     # GPU relay: client (chroot side) + server (TV s
 ./kiosk/kiosk start [URL]       # kiosk stop | status; the remote's Exit key also stops it
 ```
 
-Optionally, run `./debloat/samsung-tv-debloat` after each TV boot. It stops
-telemetry, ads and other daemons the TV doesn't need, which frees RAM for Chromium.
+Optionally, debloat after each TV boot. This stops telemetry, ads and other
+daemons the TV doesn't need, which frees RAM for Chromium. Either:
+- run `./debloat/samsung-tv-debloat` from the PC; or
+- have the TV do it at boot. Copy `debloat/debloat-tv.sh` to the TV with
+  `./debloat/samsung-tv-debloat install DIR`, then add this to whatever already
+  runs at boot on your set:
+
+  ```sh
+  bash -s -- stop --wait-boot < DIR/debloat-tv.sh > /tmp/debloat.log 2>&1 &
+  ```
+
+  It waits for startup to finish, then checks twice more for daemons that start late.
 
 ## How it works
 
@@ -94,7 +104,7 @@ the video frame rate.
 | `kiosk/` | image build (`build-image.sh`, Dockerfiles), PC driver (`kiosk`), TV side (`kiosk-tv.sh`) |
 | `mgl/` | GLES2/EGL remoting: client, server, code generator, tests, GPU probe ([details](mgl/README.md)) |
 | `wlxbridge/` | Wayland window, remote input and audio FIFO for the chroot (Go, static) |
-| `debloat/` | stops a Tizen 3.0 TV's non-essential daemons for the current boot |
+| `debloat/` | stops a Tizen 3.0 TV's non-essential daemons for the current boot (from a PC or a boot hook) |
 | `tools/` | `tvshot` (screenshot of a TV window), `tvkey` (press remote keys), `cdp.mjs` (DevTools) |
 
 ## Debugging
