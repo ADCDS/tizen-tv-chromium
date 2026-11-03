@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# tvkey KEY...: press keys as if on the remote, by writing input events to the
+# TV's remote-control input device. KEY is a name below or an evdev key code.
+#   tvkey down down enter      tvkey back      tvkey 103
+# Settings: TV_HOST, TV_KEY and TV_RC_DEVICE (default /dev/input/event0) from ../tv.conf.
+set -euo pipefail
+top=$(dirname "$(dirname "$(readlink -f "$0")")")
+[ -f "$top/tv.conf" ] && . "$top/tv.conf"
+TV_HOST=${TV_HOST:?set TV_HOST in tv.conf}
+TV_KEY=${TV_KEY:-$HOME/.ssh/id_ed25519}
+dev=${TV_RC_DEVICE:-/dev/input/event0}
+[ $# -gt 0 ] || { sed -n '2,5s/^# \{0,1\}//p' "$0"; exit 2; }
+# struct input_event on the TV's 32-bit kernel: timeval (8 bytes, ignored), u16 type,
+# u16 code, s32 value. Each press: EV_KEY down, EV_SYN, EV_KEY up, EV_SYN.
+syn='\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0'
+ev() { printf '\\0\\0\\0\\0\\0\\0\\0\\0\\x01\\0\\x%02x\\x%02x\\x%02x\\0\\0\\0' $(($1 & 255)) $(($1 >> 8)) "$2"; }
+script=""
+for k in "$@"; do
+  case ${k,,} in
+    up) c=103 ;; down) c=108 ;; left) c=105 ;; right) c=106 ;;
+    enter | ok) c=28 ;; back) c=1 ;; exit) c=174 ;;
+    [0-9]) c=$((k == 0 ? 11 : k + 1)) ;;
+    *[!0-9]* | "") echo "unknown key: $k" >&2; exit 2 ;;
+    *) c=$k ;;
+  esac
+  script+="printf '$(ev "$c" 1)$syn' > $dev; sleep 0.1; printf '$(ev "$c" 0)$syn' > $dev; sleep 0.5; "
+done
+ssh -i "$TV_KEY" -o BatchMode=yes -o ConnectTimeout=10 "$TV_HOST" "$script"

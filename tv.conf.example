@@ -1,0 +1,13 @@
+# Copy to tv.conf (ignored by git) and adjust. Read by kiosk/kiosk, mgl/fetch-tv-libs.sh,
+# debloat/samsung-tv-debloat and tools/*.
+
+# Root SSH access to the TV.
+TV_HOST=root@192.168.1.50
+TV_KEY=~/.ssh/id_ed25519
+
+# Kiosk (all optional).
+KIOSK_URL=https://example.org/  # page opened by `kiosk start` without a URL
+KIOSK_LANG=en_US                # Chromium UI language and Accept-Language, e.g. pt_BR
+KIOSK_TZ=UTC                    # e.g. America/Sao_Paulo
+#KIOSK_GPU=0                    # force software rendering (default: GPU when mgl is installed)
+#KIOSK_W=1920 KIOSK_H=1080 KIOSK_SCALE=2

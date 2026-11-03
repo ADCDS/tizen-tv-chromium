@@ -1,0 +1,9 @@
+# Kiosk image = base + wlxbridge. Built by build-image.sh with wlxbridge/build as
+# the context.
+FROM tvchrome:trixie
+COPY wlxbridge-armv7 /usr/local/bin/wlxbridge
+# GPU mode: ANGLE dlopen()s libEGL.so.1; point it at the mgl relay client that
+# kiosk-tv.sh drops into the chroot's tmpfs. Dangling (software mode) = no GPU.
+RUN mkdir -p /data /run/pulse \
+ && ln -s /tmp/mgl/libEGL.so.1 /usr/lib/arm-linux-gnueabihf/libEGL.so.1 \
+ && ln -s /tmp/mgl/libEGL.so.1 /usr/lib/arm-linux-gnueabihf/libGLESv2.so.2

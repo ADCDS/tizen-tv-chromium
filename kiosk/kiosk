@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# kiosk: drive the Chromium kiosk on the TV from a PC.
+#   kiosk start [URL] | stop | status    run kiosk-tv.sh on the TV
+#   kiosk install                        copy the built image, mgl and wlxbridge to the TV's stick
+# Settings: ../tv.conf (see tv.conf.example), overridable by the environment.
+set -euo pipefail
+here=$(dirname "$(readlink -f "$0")")
+top=$(dirname "$here")
+[ -f "$top/tv.conf" ] && . "$top/tv.conf"
+TV_HOST=${TV_HOST:?set TV_HOST in tv.conf (e.g. root@192.168.1.50)}
+TV_KEY=${TV_KEY:-$HOME/.ssh/id_ed25519}
+tv() { ssh -i "$TV_KEY" -o BatchMode=yes -o ConnectTimeout=10 "$TV_HOST" "$@"; }
+
+# Settings passed to kiosk-tv.sh (KIOSK_*) and to mgl-server (MGL_* debug options).
+envs=""
+for v in KIOSK_URL KIOSK_W KIOSK_H KIOSK_SCALE KIOSK_GPU KIOSK_LANG KIOSK_TZ KIOSK_NOBRIDGE \
+  MGL_OUTPUT_SIZE MGL_TRACE MGL_CHECK MGL_FENCE_FINISH; do
+  [ -n "${!v:-}" ] && envs+="$v=$(printf %q "${!v}") "
+done
+remote() { tv "${envs}bash -s --$(printf ' %q' "$@")" < "$here/kiosk-tv.sh"; }
+
+install() {
+  dir=$(remote storedir)
+  echo "installing to $TV_HOST:$dir"
+  # name on the stick : local build output
+  for pair in "rootfs.sqfs:$here/build/rootfs.sqfs" \
+    "mgl-server:$top/mgl/build/tv/mgl-server" \
+    "libmgl.so:$top/mgl/build/armhf/libEGL.so.1" \
+    "wlxbridge:$top/wlxbridge/build/wlxbridge-armv7"; do
+    name=${pair%%:*} src=${pair#*:}
+    if [ ! -f "$src" ]; then echo "  $name: not built ($src), skipped"; continue; fi
+    want=$(sha256sum "$src" | cut -c1-64)
+    have=$(tv "sha256sum '$dir/$name' 2>/dev/null | cut -c1-64" || true)
+    if [ "$want" = "$have" ]; then echo "  $name: up to date"; continue; fi
+    # USB sticks on the TV occasionally write a few blocks wrong: verify, retry.
+    for try in 1 2 3; do
+      printf '  %s: copying %s ... ' "$name" "$(du -h "$src" | cut -f1)"
+      tv "cat > '$dir/$name.part' && sync" < "$src"
+      got=$(tv "sha256sum '$dir/$name.part' | cut -c1-64")
+      [ "$got" = "$want" ] && break
+      echo "checksum mismatch (attempt $try)"
+      [ "$try" = 3 ] && { tv "rm -f '$dir/$name.part'"; exit 1; }
+    done
+    tv "mv '$dir/$name.part' '$dir/$name'"
+    echo ok
+  done
+  echo "restart the kiosk (kiosk stop; kiosk start) to use the new files"
+}
+
+case ${1:-} in
+  install) install ;;
+  start | stop | status) remote "$@" ;;
+  *) echo "usage: kiosk start [URL] | stop | status | install" >&2; exit 2 ;;
+esac

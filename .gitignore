@@ -1,0 +1,4 @@
+build/
+mgl/sysroot/
+tv.conf
+__pycache__/

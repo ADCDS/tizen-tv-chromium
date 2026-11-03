@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# tvshot OUT.png [WINDOW_TITLE]: save what a window on the TV shows, using the
+# compositor's own dump (enlightenment_info). Default window: the topmost one
+# titled "Chromium" (the GPU window in GPU mode, the bridge in software mode).
+# Also prints the window stack. Settings: TV_HOST and TV_KEY from ../tv.conf.
+set -euo pipefail
+top=$(dirname "$(dirname "$(readlink -f "$0")")")
+[ -f "$top/tv.conf" ] && . "$top/tv.conf"
+TV_HOST=${TV_HOST:?set TV_HOST in tv.conf}
+TV_KEY=${TV_KEY:-$HOME/.ssh/id_ed25519}
+out=${1:?usage: tvshot OUT.png [WINDOW_TITLE]}
+title=${2:-Chromium}
+ssh -i "$TV_KEY" -o BatchMode=yes -o ConnectTimeout=10 "$TV_HOST" "bash -s -- $(printf %q "$title")" > "$out" <<'EOF'
+export XDG_RUNTIME_DIR=/run
+d=/tmp/tvshot; rm -rf $d; mkdir -p $d
+enlightenment_info -topvwins | grep -E '^ +[0-9]+ 0x' >&2
+enlightenment_info -dump_topvwins $d >/dev/null 2>&1
+# Columns end with: Map Frame PL@ZPos Parent Title (Foc may be blank, so count from the end).
+id=$(enlightenment_info -topvwins | awk -v t="$1" '$NF == t && $(NF-4) == "V" { print $2; exit }')
+[ -n "$id" ] || { echo "no visible window titled $1" >&2; exit 1; }
+cat $d/*/$id.png; rm -rf $d
+EOF
+echo "saved $out"
