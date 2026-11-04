@@ -34,7 +34,9 @@ for e in "${entries[@]}"; do
   for f in config.xml index.html; do
     sed -e "s|@ID@|$id|g" -e "s|@PKG@|$pkg|g" -e "s|@NAME@|$(esc "$name")|g" "$here/template/$f" > "$d/$f"
   done
-  python3 -I "$here/make_icons.py" "${icon/#\~/$HOME}" "$name" "$d"
+  icon=${icon/#\~/$HOME}
+  case $icon in "" | /* | http://* | https://*) ;; *) icon=$top/$icon ;; esac # relative: to the repo
+  python3 -I "$here/make_icons.py" "$icon" "$name" "$d"
   "$TIZEN" package -t wgt -s "$PROFILE" -- "$d" | tail -2
   mv "$d"/*.wgt "$here/build/$id.wgt"
   echo "built tiles/build/$id.wgt ($pkg.$id)"

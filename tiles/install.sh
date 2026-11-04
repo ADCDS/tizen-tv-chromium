@@ -1,37 +1,39 @@
 #!/usr/bin/env bash
 # install.sh [-u]: install the tiles built by build.sh (tiles/build/*.wgt) on the
-# TV over SSH with the TV's package manager; -u uninstalls them.
-# Settings: TV_HOST, TV_KEY and the KIOSK_TILE_PKG_<id> package ids from ../tv.conf.
+# TV with Samsung's app installer over the TV's debug bridge (sdb); -u removes
+# them. Only apps installed this way can be started from the TV's home screen
+# (a plain pkgcmd install runs from a shell but not from the home bar).
+# Needs Developer Mode on the TV. Settings (../tv.conf): TV_HOST, the
+# KIOSK_TILE_PKG_<id> package ids, TIZEN_SDB (default ~/tizen-studio/tools/sdb),
+# TV_SDB (default <TV_HOST's host>:26101).
 set -euo pipefail
 here=$(dirname "$(readlink -f "$0")")
 top=$(dirname "$here")
 [ -f "$top/tv.conf" ] && . "$top/tv.conf"
-TV_HOST=${TV_HOST:?set TV_HOST in tv.conf}
-TV_KEY=${TV_KEY:-$HOME/.ssh/id_ed25519}
-tv() { ssh -i "$TV_KEY" -o BatchMode=yes -o ConnectTimeout=10 "$TV_HOST" "$@"; }
+SDB=${TIZEN_SDB:-$HOME/tizen-studio/tools/sdb}
+host=${TV_HOST:?set TV_HOST in tv.conf}
+host=${host#*@}
+ip=$(getent ahostsv4 "$host" | awk 'NR == 1 { print $1 }')
+DEV=${TV_SDB:-${ip:-$host}:26101}
 remove=0
 [ "${1:-}" = -u ] && remove=1
 shopt -s nullglob
 wgts=("$here"/build/*.wgt)
 [ ${#wgts[@]} -gt 0 ] || { echo "nothing built: run tiles/build.sh first" >&2; exit 1; }
+"$SDB" connect "$DEV" | tail -1
+dir=/home/owner/share/tmp/sdk_tools
 for w in "${wgts[@]}"; do
   id=$(basename "$w" .wgt)
   var=KIOSK_TILE_PKG_$id
   pkg=${!var:?no $var in tv.conf}
   if [ "$remove" = 1 ]; then
-    echo "removing $id ($pkg)"
-    tv "pkgcmd -u -n $pkg -q" | tail -2
+    printf '%s: ' "$id"
+    "$SDB" -s "$DEV" shell 0 vd_appuninstall "$pkg" | grep -E "completed|fail" || true
     continue
   fi
-  echo "installing $id ($pkg.$id)"
-  tv "cat > /tmp/$pkg.wgt" < "$w"
-  # pkgcmd prints the result; "val[ok]" on success.
-  if tv "pkgcmd -i -t wgt -p /tmp/$pkg.wgt -q; rm -f /tmp/$pkg.wgt" | tee /dev/stderr | grep -q 'val\[ok\]'; then
-    echo "  ok"
-  else
-    echo "  the TV refused the package (see above). If root pkgcmd isn't allowed, install it" >&2
-    echo "  through sdb instead (Tizen Studio): sdb push it, then vd_appinstall <pkgid> <path>." >&2
-    exit 1
-  fi
+  printf '%s (%s): ' "$id" "$pkg"
+  "$SDB" -s "$DEV" push "$w" "$dir/$pkg.wgt" >/dev/null
+  out=$("$SDB" -s "$DEV" shell 0 vd_appinstall "$pkg" "$dir/$pkg.wgt")
+  if grep -q "install completed" <<< "$out"; then echo ok; else echo "failed:"; echo "$out" >&2; exit 1; fi
 done
-echo "Done. Pin the tiles to the home bar from the TV's Apps screen (Add to Home)."
+echo "Done. New tiles show up in the TV's Apps screen (pin them to the home bar from there)."

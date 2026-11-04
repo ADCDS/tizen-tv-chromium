@@ -90,7 +90,7 @@ them to the home bar from the TV's Apps screen.
 The set has 1.3 GB, and Samsung's own UI takes most of it as the day goes on.
 Chromium needs roughly 200-300 MB. When the TV runs short, its app launcher
 (which also starts the tiles) hangs or fails, and Chromium starts very slowly or
-is killed. So the helper stops a hidden kiosk when less than 250 MB is
+is killed. So the helper stops a hidden kiosk when less than 150 MB is
 available (`-min-free`), Chromium runs in low-end device mode (`KIOSK_LOWEND`),
 and the debloat matters.
 

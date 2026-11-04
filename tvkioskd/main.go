@@ -8,7 +8,8 @@
 //	GET  /state        JSON: current app, running, visible, apps
 //	GET  /start        the browser's start page
 //
-// Opening the TV's own web browser opens the kiosk's browser instead (-takeover).
+// With -takeover org.tizen.browser, opening the TV's own web browser opens the
+// kiosk's browser instead.
 //
 // It listens on 127.0.0.1 only. Settings, written by `kiosk install` into the
 // kiosk directory on the stick: kiosk.env (KIOSK_* for kiosk-tv.sh) and
@@ -26,8 +27,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -89,9 +92,9 @@ type daemon struct {
 }
 
 // minFree: below this much available memory (MB) a hidden kiosk is stopped.
-// The TV has 1.3 GB; a loaded Chromium costs about 280 MB, and the TV's own
+// The TV has 1.3 GB; a loaded Chromium (low-end mode) costs about 120 MB, and the TV's own
 // app launcher (which also starts our tiles) fails when memory runs short.
-var minFree = flag.Int("min-free", 250, "stop the hidden kiosk when the TV has less than this many MB available")
+var minFree = flag.Int("min-free", 150, "stop the hidden kiosk when the TV has less than this many MB available")
 
 // memWatch stops the kiosk while it is hidden if the TV runs short of memory;
 // the next open then starts it again (about 15 s instead of instantly).
@@ -156,13 +159,29 @@ func (d *daemon) open(a App, from string) error {
 	d.cur = a.ID
 	d.left = time.Time{}
 	if !chromiumRunning() {
-		log.Printf("open %s: starting the kiosk", a.ID)
-		d.tabs.reset()
-		if err := startKiosk(d.dir, a.URL); err != nil {
-			return err
-		}
-		if !d.win.waitVisible(150 * time.Second) {
-			log.Printf("open %s: window not visible yet", a.ID)
+		// Reads from the USB stick occasionally come back corrupt (the kernel
+		// logs SQUASHFS errors) and Chromium dies of SIGBUS while starting; a
+		// second start almost always works.
+		for attempt := 1; ; attempt++ {
+			log.Printf("open %s: starting the kiosk (attempt %d)", a.ID, attempt)
+			d.tabs.reset()
+			if err := startKiosk(d.dir, a.URL); err != nil {
+				return err
+			}
+			started := time.Now()
+			for !d.win.waitVisible(2 * time.Second) {
+				if time.Since(started) > 5*time.Second && !chromiumRunning() {
+					break // died while starting
+				}
+				if time.Since(started) > 150*time.Second {
+					log.Printf("open %s: window not visible yet", a.ID)
+					break
+				}
+			}
+			if d.win.isVisible() || chromiumRunning() || attempt == 3 {
+				break
+			}
+			log.Printf("open %s: Chromium exited while starting", a.ID)
 		}
 		err := d.tabs.focus(a, 60*time.Second)
 		d.dismiss(from)
@@ -216,9 +235,33 @@ func (d *daemon) leave() {
 	d.left = time.Now()
 }
 
+// systemLabel makes sure the helper runs under the SMACK label "System". The
+// tiles (apps, labelled User::Pkg::<id>) may only talk to sockets of system
+// services; a process started at boot can get the floor label "_", whose
+// sockets the tiles can't reach. SMACK labels are per thread, so the label is
+// set on this thread and the program re-executed, which gives every thread
+// (and the listening socket) the new label.
+func systemLabel() {
+	cur, err := os.ReadFile("/proc/self/attr/current")
+	if err != nil || strings.Trim(string(cur), "\x00\n ") != "_" || os.Getenv("TVKIOSKD_RELABELED") != "" {
+		return
+	}
+	runtime.LockOSThread()
+	if err := os.WriteFile(fmt.Sprintf("/proc/self/task/%d/attr/current", syscall.Gettid()), []byte("System"), 0); err != nil {
+		log.Printf("SMACK label: %v (tiles may not reach the helper)", err)
+		return
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		err = syscall.Exec(exe, os.Args, append(os.Environ(), "TVKIOSKD_RELABELED=1"))
+	}
+	log.Printf("SMACK relabel: re-exec: %v", err)
+}
+
 func main() {
+	systemLabel()
 	dir := flag.String("dir", "", "kiosk directory on the stick (default: kiosk/ on the partition labelled tvchrome)")
-	takeoverApp := flag.String("takeover", "org.tizen.browser", "TV app replaced by the kiosk's browser when opened (empty: none)")
+	takeoverApp := flag.String("takeover", "", "TV app to replace with the kiosk's browser when it comes on screen, e.g. org.tizen.browser (default: none; a tile is lighter: the TV keeps its own browser preloaded)")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	if *dir == "" {
