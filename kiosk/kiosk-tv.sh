@@ -11,6 +11,8 @@
 #   KIOSK_SCALE  device scale factor (default 2: pages lay out at 960x540 CSS pixels)
 #   KIOSK_LANG   Chromium UI and Accept-Language, e.g. pt_BR (default en_US)
 #   KIOSK_TZ     time zone, e.g. America/Sao_Paulo (default UTC)
+#   KIOSK_LOWEND 1 (default): Chromium's low-end device mode (smaller caches and tiles):
+#                the TV has 1.3 GB and its own UI needs most of it; 0: off
 #   KIOSK_SPATNAV 1 (default): arrow keys move between links on pages without their own
 #                key handling (Chromium's spatial navigation); 0: off
 #   KIOSK_LEAVE  host:port of the TV helper (tvkioskd): the remote's Exit key asks it
@@ -187,6 +189,7 @@ ALSA
   ext_flags="--accept-lang=$acc"
   [ -f "$R/opt/tvkit/manifest.json" ] && ext_flags="$ext_flags --load-extension=/opt/tvkit"
   [ "${KIOSK_SPATNAV:-1}" = 1 ] && ext_flags="$ext_flags --enable-spatial-navigation"
+  [ "${KIOSK_LOWEND:-1}" = 1 ] && ext_flags="$ext_flags --enable-low-end-device-mode"
   # --window-size is in DIPs (scaled by the device scale factor), so divide,
   # or the window overflows the screen and the right/bottom of the page is cut.
   wd=$(awk -v v="$W" -v s="$SCALE" 'BEGIN { printf "%d", v / s + 0.5 }')

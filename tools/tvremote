@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""tvremote: see and drive the TV from a PC.
+
+  tools/tvremote [serve] [--port 8790]   web page with the live screen and a remote
+                                         control: http://localhost:8790
+  tools/tvremote shot FILE.jpg [--scale N]   save what the TV shows
+  tools/tvremote key NAME...             press remote keys (see KEYS), e.g. key home right ok
+
+It runs tvremote's agent on the TV over one SSH session (uploaded to /tmp on
+first use; build it with `make -C tvremote`). The screen is the TV's graphics
+plane as the compositor mirrors it: TV pictures on the video plane (antenna,
+HDMI) show as black. Settings: TV_HOST and TV_KEY from ../tv.conf.
+"""
+import hashlib
+import http.server
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+TOP = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+AGENT = os.path.join(TOP, "tvremote", "build", "tvremote-agent-armv7")
+
+# Remote key -> evdev code written to the TV's remote input device (the TV's
+# keymap code minus 8; Samsung's keymap puts many keys at unusual codes).
+KEYS = {
+    "power": None,  # deliberately not offered
+    "up": 103, "down": 108, "left": 105, "right": 106, "ok": 28, "back": 1, "exit": 174,
+    "home": 63, "source": 64, "menu": 396, "info": 188, "chlist": 65,
+    "red": 59, "green": 60, "yellow": 61, "blue": 62,
+    "volup": 68, "voldown": 67, "mute": 66, "chup": 88, "chdown": 87,
+    "play": 200, "pause": 201, "stop": 166, "rew": 168, "ff": 208,
+    **{str(d): (11 if d == 0 else d + 1) for d in range(10)},
+}
+KEYS = {k: v for k, v in KEYS.items() if v}
+
+
+def conf():
+    """TV_HOST and TV_KEY from tv.conf (shell syntax) or the environment."""
+    vals = {}
+    path = os.path.join(TOP, "tv.conf")
+    if os.path.exists(path):
+        out = subprocess.run(["bash", "-c", f'set -a; . {shlex.quote(path)}; echo "$TV_HOST"; echo "$TV_KEY"'],
+                             capture_output=True, text=True).stdout.splitlines()
+        vals = dict(zip(["TV_HOST", "TV_KEY"], out + ["", ""]))
+    host = os.environ.get("TV_HOST") or vals.get("TV_HOST")
+    key = os.environ.get("TV_KEY") or vals.get("TV_KEY") or os.path.expanduser("~/.ssh/id_ed25519")
+    if not host:
+        sys.exit("set TV_HOST in tv.conf")
+    return host, os.path.expanduser(key)
+
+
+class Agent:
+    """The agent on the TV, over one SSH session; restarted if it dies."""
+
+    def __init__(self):
+        self.host, self.keyfile = conf()
+        self.lock = threading.Lock()
+        self.p = None
+
+    def ssh(self, cmd, **kw):
+        return subprocess.run(["ssh", "-i", self.keyfile, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", self.host, cmd], **kw)
+
+    def start(self):
+        if not os.path.exists(AGENT):
+            sys.exit(f"{AGENT} missing: run make -C tvremote")
+        want = hashlib.sha256(open(AGENT, "rb").read()).hexdigest()
+        have = self.ssh("sha256sum /tmp/tvremote-agent 2>/dev/null | cut -c1-64", capture_output=True, text=True).stdout.strip()
+        if have != want:
+            with open(AGENT, "rb") as f:
+                self.ssh("cat > /tmp/tvremote-agent.new && chmod 755 /tmp/tvremote-agent.new && mv -f /tmp/tvremote-agent.new /tmp/tvremote-agent",
+                         stdin=f, check=True)
+        self.p = subprocess.Popen(["ssh", "-i", self.keyfile, "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", self.host,
+                                   "XDG_RUNTIME_DIR=/run exec /tmp/tvremote-agent"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def call(self, line):
+        """Send one command; returns (header, payload or None)."""
+        with self.lock:
+            for attempt in (1, 2):
+                if self.p is None or self.p.poll() is not None:
+                    self.start()
+                try:
+                    self.p.stdin.write((line + "\n").encode())
+                    self.p.stdin.flush()
+                    head = self.p.stdout.readline().decode().strip()
+                    if not head:
+                        raise OSError("agent closed")
+                    if head.startswith("frame "):
+                        n = int(head.split()[1])
+                        data = b""
+                        while len(data) < n:
+                            chunk = self.p.stdout.read(n - len(data))
+                            if not chunk:
+                                raise OSError("agent closed")
+                            data += chunk
+                        return head, data
+                    return head, None
+                except (OSError, ValueError):
+                    if self.p:
+                        self.p.kill()
+                    self.p = None
+                    if attempt == 2:
+                        raise
+
+    def frame(self, scale=2):
+        head, data = self.call(f"frame {int(scale)}")
+        if data is None:
+            raise RuntimeError(head)
+        return data
+
+    def key(self, name):
+        code = KEYS.get(name.lower())
+        if code is None:
+            raise KeyError(name)
+        head, _ = self.call(f"key {code}")
+        if head != "ok":
+            raise RuntimeError(head)
+
+
+PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>TV remote</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #101216; color: #dde; font: 14px system-ui, sans-serif; display: flex; gap: 18px; padding: 16px; flex-wrap: wrap; }
+  #screen { width: min(960px, 100%); aspect-ratio: 16/9; background: #000; border-radius: 8px; object-fit: contain; }
+  #side { display: flex; flex-direction: column; gap: 10px; min-width: 250px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 72px); gap: 6px; }
+  button { height: 40px; border: 0; border-radius: 8px; background: #262b35; color: #eee; font-size: 14px; cursor: pointer; }
+  button:active, button.hit { background: #2d6cdf; }
+  .ok { background: #3a4252; font-weight: bold; }
+  .red { background: #8b2a2a; } .green { background: #2a7a3a; } .yellow { background: #8a7a1a; } .blue { background: #2a4a8b; }
+  #status { color: #889; font-size: 12px; min-height: 16px; }
+  .hint { color: #778; font-size: 12px; line-height: 1.5; max-width: 250px; }
+  kbd { background: #262b35; border-radius: 4px; padding: 0 4px; }
+</style></head><body>
+<img id="screen" alt="TV screen">
+<div id="side">
+  <div class="grid">
+    <button data-k="home">Home</button><button data-k="source">Source</button><button data-k="menu">Menu</button>
+    <button data-k="back">Back</button><button data-k="up">▲</button><button data-k="exit">Exit</button>
+    <button data-k="left">◀</button><button data-k="ok" class="ok">OK</button><button data-k="right">▶</button>
+    <button data-k="info">Info</button><button data-k="down">▼</button><button data-k="chlist">Ch list</button>
+    <button data-k="red" class="red">A</button><button data-k="green" class="green">B</button><button data-k="yellow" class="yellow">C</button>
+    <button data-k="blue" class="blue">D</button><button data-k="volup">Vol +</button><button data-k="chup">Ch +</button>
+    <button data-k="mute">Mute</button><button data-k="voldown">Vol −</button><button data-k="chdown">Ch −</button>
+    <button data-k="rew">⏪</button><button data-k="play">▶︎ / ⏸</button><button data-k="ff">⏩</button>
+    <button data-k="1">1</button><button data-k="2">2</button><button data-k="3">3</button>
+    <button data-k="4">4</button><button data-k="5">5</button><button data-k="6">6</button>
+    <button data-k="7">7</button><button data-k="8">8</button><button data-k="9">9</button>
+    <button data-k="stop">⏹</button><button data-k="0">0</button><button data-k="pause">⏸</button>
+  </div>
+  <div id="status"></div>
+  <div class="hint">Keyboard: arrows, <kbd>Enter</kbd> OK, <kbd>Backspace</kbd>/<kbd>Esc</kbd> Back,
+    <kbd>H</kbd> Home, <kbd>S</kbd> Source, <kbd>M</kbd> Menu, <kbd>X</kbd> Exit, <kbd>0</kbd>–<kbd>9</kbd>,
+    <kbd>F1</kbd>–<kbd>F4</kbd> A–D, <kbd>+</kbd>/<kbd>−</kbd> volume, <kbd>PgUp</kbd>/<kbd>PgDn</kbd> channel.
+    The TV picture itself (antenna, HDMI) shows as black: only the TV's graphics are mirrored.</div>
+</div>
+<script>
+const st = document.getElementById('status'), img = document.getElementById('screen');
+async function press(k, el) {
+  if (el) { el.classList.add('hit'); setTimeout(() => el.classList.remove('hit'), 150); }
+  const r = await fetch('/key/' + k, { method: 'POST' });
+  st.textContent = r.ok ? 'sent ' + k : 'error: ' + await r.text();
+}
+document.querySelectorAll('button[data-k]').forEach((b) => b.onclick = () => press(b.dataset.k, b));
+const map = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Enter: 'ok', Backspace: 'back',
+  Escape: 'back', h: 'home', s: 'source', m: 'menu', x: 'exit', i: 'info', F1: 'red', F2: 'green', F3: 'yellow', F4: 'blue',
+  '+': 'volup', '=': 'volup', '-': 'voldown', PageUp: 'chup', PageDown: 'chdown', ' ': 'play' };
+addEventListener('keydown', (e) => {
+  const k = /^[0-9]$/.test(e.key) ? e.key : map[e.key];
+  if (!k || e.ctrlKey || e.metaKey || e.altKey) return;
+  e.preventDefault();
+  press(k, document.querySelector(`button[data-k="${k}"]`));
+});
+let last = 0;
+async function loop() {
+  const t = Date.now();
+  try {
+    const r = await fetch('/frame.jpg?t=' + t);
+    if (r.ok) { const u = URL.createObjectURL(await r.blob()); const old = img.src; img.src = u; if (old.startsWith('blob:')) URL.revokeObjectURL(old); }
+    else st.textContent = 'screen: ' + await r.text();
+  } catch (e) { st.textContent = 'screen: ' + e; }
+  setTimeout(loop, Math.max(0, 150 - (Date.now() - t)));
+}
+loop();
+</script></body></html>
+"""
+
+
+def serve(port):
+    agent = Agent()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def send(self, code, body, ctype="text/plain"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            if u.path == "/":
+                return self.send(200, PAGE.encode(), "text/html; charset=utf-8")
+            if u.path == "/frame.jpg":
+                scale = urllib.parse.parse_qs(u.query).get("scale", ["2"])[0]
+                try:
+                    return self.send(200, agent.frame(int(scale)), "image/jpeg")
+                except Exception as e:
+                    return self.send(503, str(e).encode())
+            if u.path == "/keys":
+                return self.send(200, json.dumps(sorted(KEYS)).encode(), "application/json")
+            if u.path.startswith("/key/"):
+                return self.do_POST()
+            self.send(404, b"not found")
+
+        def do_POST(self):
+            m = re.fullmatch(r"/key/([A-Za-z0-9]+)", urllib.parse.urlparse(self.path).path)
+            if not m:
+                return self.send(404, b"not found")
+            try:
+                agent.key(m.group(1))
+                self.send(200, b"ok")
+            except KeyError:
+                self.send(400, b"unknown key")
+            except Exception as e:
+                self.send(503, str(e).encode())
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+    print(f"TV remote on http://localhost:{port}  (Ctrl-C to stop)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def main(argv):
+    args = list(argv)
+    opt = lambda name, default: (args.pop(args.index(name) + 1), args.remove(name))[0] if name in args else default
+    port = int(opt("--port", 8790))
+    scale = int(opt("--scale", 2))
+    cmd = args.pop(0) if args else "serve"
+    if cmd == "serve":
+        serve(port)
+    elif cmd == "shot" and args:
+        data = Agent().frame(scale)
+        open(args[0], "wb").write(data)
+        print(f"saved {args[0]} ({len(data)} bytes)")
+    elif cmd == "key" and args:
+        a = Agent()
+        for name in args:
+            a.key(name)
+            time.sleep(0.35)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

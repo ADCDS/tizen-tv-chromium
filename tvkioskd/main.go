@@ -19,6 +19,7 @@ import (
 	"embed"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -83,7 +84,65 @@ type daemon struct {
 	mu   sync.Mutex // serializes open/leave
 	win  *window
 	tabs *tabs
-	cur  string // current app id
+	cur  string    // current app id
+	left time.Time // when the kiosk was last hidden by leave (zero: shown)
+}
+
+// minFree: below this much available memory (MB) a hidden kiosk is stopped.
+// The TV has 1.3 GB; a loaded Chromium costs about 280 MB, and the TV's own
+// app launcher (which also starts our tiles) fails when memory runs short.
+var minFree = flag.Int("min-free", 250, "stop the hidden kiosk when the TV has less than this many MB available")
+
+// memWatch stops the kiosk while it is hidden if the TV runs short of memory;
+// the next open then starts it again (about 15 s instead of instantly).
+func (d *daemon) memWatch() {
+	for range time.Tick(3 * time.Second) {
+		d.mu.Lock()
+		if !d.left.IsZero() && time.Since(d.left) > 3*time.Second && chromiumRunning() {
+			if avail := memAvailableMB(); avail > 0 && avail < *minFree {
+				log.Printf("low memory (%d MB available) while hidden: stopping the kiosk", avail)
+				d.tabs.reset()
+				kiosk(d.dir, "stop")
+			}
+		}
+		d.mu.Unlock()
+	}
+}
+
+// pressKey presses a remote key (evdev code) on the remote's input device:
+// struct input_event on the TV's 32-bit kernel (timeval, type, code, value).
+func pressKey(code uint16) {
+	f, err := os.OpenFile("/dev/input/event0", os.O_WRONLY, 0)
+	if err != nil {
+		log.Printf("key %d: %v", code, err)
+		return
+	}
+	defer f.Close()
+	ev := func(typ, code uint16, value uint32) []byte {
+		b := make([]byte, 16)
+		b[8], b[9] = byte(typ), byte(typ>>8)
+		b[10], b[11] = byte(code), byte(code>>8)
+		b[12], b[13], b[14], b[15] = byte(value), byte(value>>8), byte(value>>16), byte(value>>24)
+		return b
+	}
+	syn := ev(0, 0, 0)
+	f.Write(append(ev(1, code, 1), syn...))
+	time.Sleep(80 * time.Millisecond)
+	f.Write(append(ev(1, code, 0), syn...))
+}
+
+func memAvailableMB() int {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return -1
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		var kb int
+		if n, _ := fmt.Sscanf(l, "MemAvailable: %d kB", &kb); n == 1 {
+			return kb / 1024
+		}
+	}
+	return -1
 }
 
 func (d *daemon) config() Config { return loadConfig(d.dir) }
@@ -95,6 +154,7 @@ func (d *daemon) open(a App, from string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.cur = a.ID
+	d.left = time.Time{}
 	if !chromiumRunning() {
 		log.Printf("open %s: starting the kiosk", a.ID)
 		d.tabs.reset()
@@ -153,6 +213,7 @@ func (d *daemon) leave() {
 	}
 	d.tabs.drop(drop)
 	d.win.send("hide")
+	d.left = time.Now()
 }
 
 func main() {
@@ -168,6 +229,7 @@ func main() {
 	d := &daemon{dir: *dir, win: newWindow(chroot + "/tmp/mglwin.sock"), tabs: newTabs()}
 	d.win.onHidden = func() { go d.tabs.pauseAll() } // covered by the TV's own UI or another app
 	go d.win.run()
+	go d.memWatch()
 	if *takeoverApp != "" {
 		go d.takeover(*takeoverApp)
 	}
@@ -191,6 +253,9 @@ func main() {
 	})
 	mux.HandleFunc("/leave", func(w http.ResponseWriter, r *http.Request) {
 		d.leave()
+		if r.URL.Query().Get("then") == "home" { // Home in the kiosk: the TV's home bar
+			go func() { time.Sleep(600 * time.Millisecond); pressKey(63) }()
+		}
 		reply(w, map[string]any{"ok": true})
 	})
 	mux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {

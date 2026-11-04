@@ -240,6 +240,7 @@ func holdAudioFifo(path string) {
 // TV keymap codes the keyer treats specially.
 const (
 	keyBack    = 9
+	keyHome    = 71 // XF86Home: the TV ignores it over the kiosk, so the helper hides us and presses it
 	keyOK      = 36
 	keyGreen   = 68 // toggles pointer mode
 	keyChDown  = 95
@@ -272,6 +273,7 @@ type keyer struct {
 	repeatKey   uint32
 	timer       *time.Timer
 	onExit      func()
+	onHome      func()
 	scrW, scrH  int16
 	pointer     bool
 	held        map[uint32]bool // arrows held in pointer mode
@@ -293,6 +295,12 @@ func (k *keyer) key(code uint32, down bool) {
 	}
 	if code == k.exitKey && !down {
 		k.onExit()
+		return
+	}
+	if code == keyHome && k.onHome != nil {
+		if !down && k.focused {
+			k.onHome()
+		}
 		return
 	}
 	if !k.focused {
@@ -417,15 +425,16 @@ func (k *keyer) repeat() {
 	}
 }
 
-// postLeave asks the kiosk helper (host:port) to hide the kiosk: POST /leave.
-func postLeave(addr string) {
+// postLeave asks the kiosk helper (host:port) to hide the kiosk: POST /leave
+// (with then=home, it also opens the TV's home bar afterwards).
+func postLeave(addr, query string) {
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		log.Printf("leave: %v", err)
 		return
 	}
 	defer c.Close()
-	fmt.Fprintf(c, "POST /leave HTTP/1.0\r\nHost: %s\r\nContent-Length: 0\r\n\r\n", addr)
+	fmt.Fprintf(c, "POST /leave%s HTTP/1.0\r\nHost: %s\r\nContent-Length: 0\r\n\r\n", query, addr)
 	c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	bufio.NewReader(c).ReadString('\n')
 }
@@ -543,11 +552,17 @@ func main() {
 	k.onExit = func() {
 		if *leave != "" {
 			log.Print("exit key: leaving")
-			go postLeave(*leave)
+			go postLeave(*leave, "")
 			return
 		}
 		log.Print("exit key, exiting")
 		os.Exit(0)
+	}
+	if *leave != "" {
+		k.onHome = func() {
+			log.Print("home key: leaving, then the TV's home bar")
+			go postLeave(*leave, "?then=home")
+		}
 	}
 	if *keysSocket != "" {
 		log.Printf("up: keys from %s", *keysSocket)

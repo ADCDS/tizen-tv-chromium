@@ -80,7 +80,19 @@ certificate profile your TV accepts (`TIZEN_PROFILE` in `tv.conf`):
 ./tiles/install.sh              # installs them on the TV (-u removes them)
 ```
 
-Then pin them to the home bar from the TV's Apps screen.
+They must be installed through Samsung's app installer (`sdb` + `vd_appinstall`,
+which `tiles/install.sh` falls back to describing): packages installed with plain
+`pkgcmd` can be started from a shell but not from the TV's home screen. Then pin
+them to the home bar from the TV's Apps screen.
+
+### Memory
+
+The set has 1.3 GB, and Samsung's own UI takes most of it as the day goes on.
+Chromium needs roughly 200-300 MB. When the TV runs short, its app launcher
+(which also starts the tiles) hangs or fails, and Chromium starts very slowly or
+is killed. So the helper stops a hidden kiosk when less than 250 MB is
+available (`-min-free`), Chromium runs in low-end device mode (`KIOSK_LOWEND`),
+and the debloat matters.
 
 Optionally, debloat after each TV boot. This stops telemetry, ads and other
 daemons the TV doesn't need, which frees RAM for Chromium. Either:
@@ -144,6 +156,7 @@ the video frame rate.
 | `tvkioskd/` | helper on the TV: opens apps (one tab each), hides/shows the kiosk, starts it on demand, Internet takeover, start page |
 | `kiosk/tvkit/` | Chromium extension: on-screen keyboard, browser bar, Back handling, pointer cursor |
 | `tiles/` | TV app tiles that open the configured apps (template, build, install) |
+| `tvremote/`, `tools/tvremote` | see and drive the TV from a PC: live screen + remote control in a browser page |
 | `tools/` | `tvshot` (screenshot of a TV window), `tvkey` (press remote keys), `cdp.mjs` (DevTools) |
 
 ## Debugging
@@ -153,6 +166,11 @@ the video frame rate.
 - `tools/tvshot out.png` saves what the TV actually shows, using the compositor's
   own window dump, and prints the window stack.
 - `tools/tvkey down down enter` presses remote keys, the same path as a real press.
+- `tools/tvremote` (after `make -C tvremote`) serves http://localhost:8790: the TV's
+  screen, refreshed continuously, and a remote control (buttons and keyboard). It
+  captures through the compositor's screen mirror, with hardware overlay planes
+  switched off while it runs; `tvremote shot FILE` and `tvremote key NAME...` do the
+  same from the command line.
 - `MGL_CHECK=1 ./kiosk/kiosk start` logs every GL call that raises an error.
   `MGL_TRACE=/tmp/kiosk/log/trace.txt` logs every call. See [mgl/README.md](mgl/README.md).
 

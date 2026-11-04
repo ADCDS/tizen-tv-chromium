@@ -27,7 +27,7 @@ remote() { tv "${envs}bash -s --$(printf ' %q' "$@")" < "$here/kiosk-tv.sh"; }
 settings() {
   mkdir -p "$here/build"
   : > "$here/build/kiosk.env"
-  for v in KIOSK_W KIOSK_H KIOSK_SCALE KIOSK_GPU KIOSK_LANG KIOSK_TZ KIOSK_SPATNAV; do
+  for v in KIOSK_W KIOSK_H KIOSK_SCALE KIOSK_GPU KIOSK_LANG KIOSK_TZ KIOSK_SPATNAV KIOSK_LOWEND; do
     [ -n "${!v:-}" ] && echo "$v=${!v}" >> "$here/build/kiosk.env"
   done
   KIOSK_APPS=${KIOSK_APPS:-} KIOSK_SEARCH=${KIOSK_SEARCH:-} KIOSK_LANG=${KIOSK_LANG:-} python3 -I -c '
