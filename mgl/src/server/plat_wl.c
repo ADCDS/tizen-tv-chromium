@@ -47,14 +47,15 @@ static int out_w, out_h;
 struct win {
 	struct wl_proxy *surface, *shell_surface, *viewport, *visibility;
 	struct wl_egl_window *egl;
-	int visible;
+	int visible; /* not fully covered (tizen_visibility); swaps are skipped when 0 */
+	int shown;   /* has presented a frame */
 };
 
 /* Window control state (see the top of the file). */
 static const struct wl_interface *policy_if, *visibility_if, *keyrouter_if; /* from libtizen-extension-client */
 static struct wl_proxy *seat, *keyboard, *policy, *keyrouter;
 static uint32_t grab_keys[64];
-static int ngrab, wsock = -1, focus_state, visible_state = 1;
+static int ngrab, wsock = -1, focus_state, visible_state; /* visible_state: a window of ours is on screen */
 #define MAXWIN 8
 #define MAXWC 8
 static struct win *wins[MAXWIN];
@@ -82,7 +83,7 @@ static void set_focus(int f) {
 }
 static void update_visible(void) {
 	int v = 0;
-	for (int i = 0; i < nwins; i++) v |= wins[i]->visible;
+	for (int i = 0; i < nwins; i++) v |= wins[i]->visible && wins[i]->shown;
 	if (v == visible_state) return;
 	visible_state = v;
 	broadcast(v ? "visible 1\n" : "visible 0\n");
@@ -149,12 +150,26 @@ static const struct {
 	void (*notify)(void *, struct wl_proxy *, uint32_t);
 } vis_listener = {vis_notify};
 
+/* Topmost grabs on our window. An iconified window still counts as topmost for
+ * tizen_keyrouter (it stays above the TV's own windows in the stack), so the
+ * grabs are dropped while hidden or the TV would lose the remote. */
+static void grab(struct win *win, int on) {
+	for (int k = 0; keyrouter && k < ngrab; k++) {
+		if (on) wl_proxy_marshal(keyrouter, req(keyrouter_if, "set_keygrab"), win->surface, grab_keys[k], 2 /* topmost */);
+		else wl_proxy_marshal(keyrouter, req(keyrouter_if, "unset_keygrab"), win->surface, grab_keys[k]);
+	}
+}
+
 static void window_command(const char *c) {
 	int hide = !strcmp(c, "hide"), show = !strcmp(c, "show");
 	if (verbose) fprintf(stderr, "mgl: window command \"%s\"\n", c);
 	for (int i = 0; policy && i < nwins; i++) {
-		if (hide) wl_proxy_marshal(policy, req(policy_if, "iconify"), wins[i]->surface);
+		if (hide) {
+			grab(wins[i], 0);
+			wl_proxy_marshal(policy, req(policy_if, "iconify"), wins[i]->surface);
+		}
 		if (show) {
+			grab(wins[i], 1);
 			wl_proxy_marshal(policy, req(policy_if, "uniconify"), wins[i]->surface);
 			wl_proxy_marshal(policy, req(policy_if, "activate"), wins[i]->surface);
 		}
@@ -269,8 +284,7 @@ EGLSurface plat_create_window_surface(EGLDisplay dpy, EGLConfig cfg, int w, int 
 	}
 	win->visible = 1;
 	if (wsock >= 0 && nwins < MAXWIN) {
-		for (int k = 0; keyrouter && k < ngrab; k++)
-			wl_proxy_marshal(keyrouter, req(keyrouter_if, "set_keygrab"), win->surface, grab_keys[k], 2 /* topmost */);
+		grab(win, 1);
 		if (policy && visibility_if) {
 			win->visibility = wl_proxy_marshal_constructor(policy, req(policy_if, "get_visibility"), visibility_if, NULL, win->surface);
 			wl_proxy_add_listener(win->visibility, (void (**)(void))&vis_listener, win);
@@ -324,7 +338,8 @@ void plat_before_swap(struct ssurface *s) {
 	if (fbo) glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fbo);
 }
 void plat_after_swap(struct ssurface *s) {
-	(void)s;
+	struct win *win = s->win;
+	if (win && !win->shown) win->shown = 1, update_visible();
 	wl_display_dispatch_pending(display); /* answer pings etc. */
 	wl_display_flush(display);
 }

@@ -105,6 +105,7 @@ the video frame rate.
 | `mgl/` | GLES2/EGL remoting: client, server, code generator, tests, GPU probe ([details](mgl/README.md)) |
 | `wlxbridge/` | Wayland window, remote input and audio FIFO for the chroot (Go, static) |
 | `debloat/` | stops a Tizen 3.0 TV's non-essential daemons for the current boot (from a PC or a boot hook) |
+| `tvkioskd/` | helper on the TV: opens apps (one tab each), hides/shows the kiosk, starts it on demand |
 | `tools/` | `tvshot` (screenshot of a TV window), `tvkey` (press remote keys), `cdp.mjs` (DevTools) |
 
 ## Debugging

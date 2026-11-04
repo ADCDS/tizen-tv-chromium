@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # kiosk: drive the Chromium kiosk on the TV from a PC.
 #   kiosk start [URL] | stop | status    run kiosk-tv.sh on the TV
-#   kiosk install                        copy the built image, mgl and wlxbridge to the TV's stick
+#   kiosk install                        copy the image, mgl, wlxbridge, tvkioskd and the
+#                                        settings (kiosk.env, apps.json) to the TV's stick
+#   kiosk daemon start|stop|status       run the TV helper (tvkioskd) by hand; normally a
+#                                        boot hook on the TV starts it
 # Settings: ../tv.conf (see tv.conf.example), overridable by the environment.
 set -euo pipefail
 here=$(dirname "$(readlink -f "$0")")
@@ -13,20 +16,43 @@ tv() { ssh -i "$TV_KEY" -o BatchMode=yes -o ConnectTimeout=10 "$TV_HOST" "$@"; }
 
 # Settings passed to kiosk-tv.sh (KIOSK_*) and to mgl-server (MGL_* debug options).
 envs=""
-for v in KIOSK_URL KIOSK_W KIOSK_H KIOSK_SCALE KIOSK_GPU KIOSK_LANG KIOSK_TZ KIOSK_NOBRIDGE \
+for v in KIOSK_URL KIOSK_W KIOSK_H KIOSK_SCALE KIOSK_GPU KIOSK_LANG KIOSK_TZ KIOSK_NOBRIDGE KIOSK_LEAVE \
   MGL_OUTPUT_SIZE MGL_TRACE MGL_CHECK MGL_FENCE_FINISH; do
   [ -n "${!v:-}" ] && envs+="$v=$(printf %q "${!v}") "
 done
 remote() { tv "${envs}bash -s --$(printf ' %q' "$@")" < "$here/kiosk-tv.sh"; }
 
+# Settings for the TV side, from tv.conf: kiosk.env (KIOSK_* for kiosk-tv.sh)
+# and apps.json (KIOSK_APPS="id|Name|URL|icon|keep-or-discard;...", KIOSK_SEARCH).
+settings() {
+  mkdir -p "$here/build"
+  : > "$here/build/kiosk.env"
+  for v in KIOSK_W KIOSK_H KIOSK_SCALE KIOSK_GPU KIOSK_LANG KIOSK_TZ; do
+    [ -n "${!v:-}" ] && echo "$v=${!v}" >> "$here/build/kiosk.env"
+  done
+  KIOSK_APPS=${KIOSK_APPS:-} KIOSK_SEARCH=${KIOSK_SEARCH:-} KIOSK_LANG=${KIOSK_LANG:-} python3 -I -c '
+import json, os
+apps = []
+for e in filter(None, os.environ["KIOSK_APPS"].split(";")):
+    f = (e.split("|") + [""] * 5)[:5]
+    apps.append({"id": f[0].strip(), "name": f[1].strip(), "url": f[2].strip(), "keep": f[4].strip() != "discard"})
+print(json.dumps({"apps": apps, "search": os.environ["KIOSK_SEARCH"], "lang": os.environ["KIOSK_LANG"]}, indent=1))
+' > "$here/build/apps.json"
+}
+
 install() {
+  settings
   dir=$(remote storedir)
   echo "installing to $TV_HOST:$dir"
-  # name on the stick : local build output
+  # name on the stick : local file
   for pair in "rootfs.sqfs:$here/build/rootfs.sqfs" \
     "mgl-server:$top/mgl/build/tv/mgl-server" \
     "libmgl.so:$top/mgl/build/armhf/libEGL.so.1" \
-    "wlxbridge:$top/wlxbridge/build/wlxbridge-armv7"; do
+    "wlxbridge:$top/wlxbridge/build/wlxbridge-armv7" \
+    "tvkioskd:$top/tvkioskd/build/tvkioskd-armv7" \
+    "kiosk-tv.sh:$here/kiosk-tv.sh" \
+    "kiosk.env:$here/build/kiosk.env" \
+    "apps.json:$here/build/apps.json"; do
     name=${pair%%:*} src=${pair#*:}
     if [ ! -f "$src" ]; then echo "  $name: not built ($src), skipped"; continue; fi
     want=$(sha256sum "$src" | cut -c1-64)
@@ -44,11 +70,28 @@ install() {
     tv "mv '$dir/$name.part' '$dir/$name'"
     echo ok
   done
-  echo "restart the kiosk (kiosk stop; kiosk start) to use the new files"
+  echo "restart the kiosk (kiosk stop; kiosk start) and the helper (kiosk daemon start) to use new binaries"
+}
+
+# The helper runs from tmpfs (the stick is noexec); a pid file tracks it.
+daemon() {
+  dir=$(remote storedir)
+  case ${1:-status} in
+    start)
+      tv "p=\$(cat /tmp/tvkioskd.pid 2>/dev/null); [ -n \"\$p\" ] && kill \$p 2>/dev/null
+          for _ in 1 2 3 4 5 6 7 8 9 10; do [ -n \"\$p\" ] && [ -d /proc/\$p ] && sleep 0.5; done
+          cp '$dir/tvkioskd' /tmp/tvkioskd.new && chmod 755 /tmp/tvkioskd.new && mv -f /tmp/tvkioskd.new /tmp/tvkioskd &&
+          ( trap '' HUP; exec </dev/null >/tmp/tvkioskd.log 2>&1; exec /tmp/tvkioskd -dir '$dir' ) &
+          echo \$! > /tmp/tvkioskd.pid; sleep 1; tail -2 /tmp/tvkioskd.log" ;;
+    stop) tv "kill \$(cat /tmp/tvkioskd.pid) 2>/dev/null && rm -f /tmp/tvkioskd.pid && echo stopped" ;;
+    status) tv "p=\$(cat /tmp/tvkioskd.pid 2>/dev/null); [ -n \"\$p\" ] && [ -d /proc/\$p ] && echo \"running (pid \$p)\" || echo 'not running (by kiosk daemon; a boot hook may run its own)'; tail -5 /tmp/tvkioskd.log 2>/dev/null" ;;
+    *) echo "usage: kiosk daemon start|stop|status" >&2; exit 2 ;;
+  esac
 }
 
 case ${1:-} in
   install) install ;;
+  daemon) daemon "${2:-status}" ;;
   start | stop | status) remote "$@" ;;
-  *) echo "usage: kiosk start [URL] | stop | status | install" >&2; exit 2 ;;
+  *) echo "usage: kiosk start [URL] | stop | status | install | daemon start|stop|status" >&2; exit 2 ;;
 esac

@@ -11,6 +11,8 @@
 #   KIOSK_SCALE  device scale factor (default 2: pages lay out at 960x540 CSS pixels)
 #   KIOSK_LANG   Chromium UI and Accept-Language, e.g. pt_BR (default en_US)
 #   KIOSK_TZ     time zone, e.g. America/Sao_Paulo (default UTC)
+#   KIOSK_LEAVE  host:port of the TV helper (tvkioskd): the remote's Exit key asks it
+#                to hide the kiosk instead of stopping it
 set -u
 R=/tmp/kiosk/root
 L=/tmp/kiosk/log # outside the chroot so logs survive stop
@@ -125,6 +127,7 @@ run() { # foreground: start everything, wait for the bridge, then tear down
     # window. Software mode: the bridge's own window shows Xvfb and grabs them.
     bridge_keys="-grab $KEYS"
     [ "$gpu" = 1 ] && bridge_keys="-keys-socket /tmp/mglwin.sock"
+    [ -n "${KIOSK_LEAVE:-}" ] && bridge_keys="$bridge_keys -leave $KIOSK_LEAVE"
     ch "$bridge_bin" -display :1 -fb /tmp/Xvfb_screen0 -wayland /run/wayland-0 -audio-fifo /tmp/audio.fifo -v $bridge_keys \
       </dev/null >"$L/bridge.log" 2>&1 &
     bridge=$!
