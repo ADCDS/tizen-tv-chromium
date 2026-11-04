@@ -24,7 +24,7 @@ func (d *daemon) takeover(appid string) {
 		log.Printf("takeover: %s is on screen, opening the kiosk browser instead", appid)
 		exec.Command("app_launcher", "-t", appid).Run()
 		if a, ok := d.config().app("browser"); ok {
-			if err := d.open(a); err != nil {
+			if err := d.open(a, ""); err != nil {
 				log.Printf("takeover: %v", err)
 			}
 		}

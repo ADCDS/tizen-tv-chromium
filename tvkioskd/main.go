@@ -23,6 +23,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -88,7 +89,9 @@ type daemon struct {
 func (d *daemon) config() Config { return loadConfig(d.dir) }
 
 // open shows the kiosk with the app's tab, starting the kiosk if needed.
-func (d *daemon) open(a App) error {
+// from is the TV app that asked (a tile), closed once the app is up: a tile
+// stays in front of our window until it is gone.
+func (d *daemon) open(a App, from string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.cur = a.ID
@@ -101,13 +104,39 @@ func (d *daemon) open(a App) error {
 		if !d.win.waitVisible(150 * time.Second) {
 			log.Printf("open %s: window not visible yet", a.ID)
 		}
-		return d.tabs.focus(a, 60*time.Second)
+		err := d.tabs.focus(a, 60*time.Second)
+		d.dismiss(from)
+		return err
 	}
 	log.Printf("open %s", a.ID)
 	d.win.send("show")
 	err := d.tabs.focus(a, 15*time.Second)
-	d.win.waitVisible(10 * time.Second)
+	d.dismiss(from)
 	return err
+}
+
+// dismiss closes the TV app that opened us (a tile), then raises our window
+// again, which the tile was covering.
+func (d *daemon) dismiss(from string) {
+	go func() {
+		if validAppID(from) {
+			exec.Command("app_launcher", "-t", from).Run()
+		}
+		time.Sleep(500 * time.Millisecond)
+		d.win.send("show")
+	}()
+}
+
+func validAppID(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, c := range s {
+		if !(c == '.' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 // leave pauses media, closes tabs of apps that aren't kept, and hides the kiosk.
@@ -153,7 +182,7 @@ func main() {
 			http.Error(w, "unknown app", http.StatusNotFound)
 			return
 		}
-		if err := d.open(a); err != nil {
+		if err := d.open(a, r.URL.Query().Get("from")); err != nil {
 			log.Printf("open %s: %v", a.ID, err)
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return

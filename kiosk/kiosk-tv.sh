@@ -36,6 +36,9 @@ store() { # mountpoint of the tvchrome partition (mount it if the TV hasn't)
     mp=/tmp/kiosk/store
     mkdir -p $mp && mount -t ext4 -o noatime "$dev" $mp || exit 1
   fi
+  # The TV mounts USB ext4 without write barriers; a power cut while Chromium
+  # writes its profile can then corrupt the filesystem (and the image on it).
+  grep " $mp " /proc/mounts | grep -q nobarrier && mount -o remount,barrier=1 "$mp" 2>/dev/null
   echo "$mp/kiosk"
 }
 
@@ -177,8 +180,12 @@ ALSA
     feat="$feat,FallbackToSWIfGLES3NotSupported"
   fi
   # tvkit (on-screen keyboard, browser bar, Back handling, cursor) from the stick.
-  ext_flags=""
-  [ -f "$R/opt/tvkit/manifest.json" ] && ext_flags="--load-extension=/opt/tvkit"
+  # Page language (navigator.language, Accept-Language); LANGUAGE above only
+  # sets Chromium's own UI language.
+  acc=$(printf %s "$LANG_UI" | tr _ -)
+  [ "${acc%%-*}" = en ] && acc="$acc,en" || acc="$acc,${acc%%-*},en-US,en"
+  ext_flags="--accept-lang=$acc"
+  [ -f "$R/opt/tvkit/manifest.json" ] && ext_flags="$ext_flags --load-extension=/opt/tvkit"
   [ "${KIOSK_SPATNAV:-1}" = 1 ] && ext_flags="$ext_flags --enable-spatial-navigation"
   # --window-size is in DIPs (scaled by the device scale factor), so divide,
   # or the window overflows the screen and the right/bottom of the page is cut.

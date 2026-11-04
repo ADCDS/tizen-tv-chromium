@@ -24,7 +24,7 @@ for e in "${entries[@]}"; do
   var=KIOSK_TILE_PKG_$id
   pkg=${!var:-}
   if [ -z "$pkg" ]; then
-    pkg=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 10)
+    pkg=t$(od -An -tx1 -N5 /dev/urandom | tr -d ' \n' | cut -c1-9) # 10 chars, starts with a letter
     printf '%s=%s\n' "$var" "$pkg" >> "$conf"
     echo "new package id for $id: $pkg (saved in tv.conf)"
   fi

@@ -35,7 +35,8 @@
     if (e.keyCode === 10009) exit(); // Back
   });
   var x = new XMLHttpRequest();
-  x.open('GET', 'http://127.0.0.1:7770/open?app=' + encodeURIComponent(APP));
+  // from: our own app id, so the helper can close this tile once the app is up.
+  x.open('GET', 'http://127.0.0.1:7770/open?app=' + encodeURIComponent(APP) + '&from=@PKG@.@ID@');
   x.timeout = 180000; // a cold start of the kiosk takes about 10-20 s
   x.onload = function () { if (x.status === 200) exit(); else fail(); };
   x.onerror = x.ontimeout = fail;

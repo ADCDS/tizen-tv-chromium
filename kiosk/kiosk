@@ -59,6 +59,11 @@ install() {
     if [ ! -f "$src" ]; then echo "  $name: not built ($src), skipped"; continue; fi
     want=$(sha256sum "$src" | cut -c1-64)
     have=$(tv "sha256sum '$dir/$name' 2>/dev/null | cut -c1-64" || true)
+    if [ -n "$have" ] && [ "$want" != "$have" ]; then
+      # Reads on the TV occasionally come back wrong from its cache while the
+      # disk is fine: re-read from the stick before rewriting a big file.
+      have=$(tv "sync; echo 3 > /proc/sys/vm/drop_caches; sha256sum '$dir/$name' 2>/dev/null | cut -c1-64" || true)
+    fi
     if [ "$want" = "$have" ]; then echo "  $name: up to date"; continue; fi
     # USB sticks on the TV occasionally write a few blocks wrong: verify, retry.
     for try in 1 2 3; do
@@ -75,18 +80,20 @@ install() {
   echo "restart the kiosk (kiosk stop; kiosk start) and the helper (kiosk daemon start) to use new binaries"
 }
 
-# The helper runs from tmpfs (the stick is noexec); a pid file tracks it.
+# The helper runs from tmpfs (the stick is noexec). It may have been started by
+# a boot hook, so it is found by its executable, not by a pid file.
 daemon() {
   dir=$(remote storedir)
+  find_helper='for p in /proc/[0-9]*; do case "$(readlink $p/exe 2>/dev/null)" in (/tmp/tvkioskd*) echo ${p#/proc/};; esac; done'
   case ${1:-status} in
     start)
-      tv "p=\$(cat /tmp/tvkioskd.pid 2>/dev/null); [ -n \"\$p\" ] && kill \$p 2>/dev/null
-          for _ in 1 2 3 4 5 6 7 8 9 10; do [ -n \"\$p\" ] && [ -d /proc/\$p ] && sleep 0.5; done
+      tv "pids=\$($find_helper); [ -n \"\$pids\" ] && kill \$pids
+          for _ in 1 2 3 4 5 6 7 8 9 10; do [ -n \"\$($find_helper)\" ] && sleep 0.5; done
           cp '$dir/tvkioskd' /tmp/tvkioskd.new && chmod 755 /tmp/tvkioskd.new && mv -f /tmp/tvkioskd.new /tmp/tvkioskd &&
           ( trap '' HUP; exec </dev/null >/tmp/tvkioskd.log 2>&1; exec /tmp/tvkioskd -dir '$dir' ) &
-          echo \$! > /tmp/tvkioskd.pid; sleep 1; tail -2 /tmp/tvkioskd.log" ;;
-    stop) tv "kill \$(cat /tmp/tvkioskd.pid) 2>/dev/null && rm -f /tmp/tvkioskd.pid && echo stopped" ;;
-    status) tv "p=\$(cat /tmp/tvkioskd.pid 2>/dev/null); [ -n \"\$p\" ] && [ -d /proc/\$p ] && echo \"running (pid \$p)\" || echo 'not running (by kiosk daemon; a boot hook may run its own)'; tail -5 /tmp/tvkioskd.log 2>/dev/null" ;;
+          sleep 1; tail -2 /tmp/tvkioskd.log" ;;
+    stop) tv "pids=\$($find_helper); [ -n \"\$pids\" ] && kill \$pids && echo stopped || echo 'not running'" ;;
+    status) tv "pids=\$($find_helper); [ -n \"\$pids\" ] && echo \"running (pid \$pids)\" || echo 'not running'; tail -5 /tmp/tvkioskd.log 2>/dev/null" ;;
     *) echo "usage: kiosk daemon start|stop|status" >&2; exit 2 ;;
   esac
 }

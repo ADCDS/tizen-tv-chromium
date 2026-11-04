@@ -4,8 +4,10 @@
 //    (React included) see ordinary input events. Remote digits type directly.
 //  - Red A (F13, remapped by wlxbridge) opens a bar: Back, Forward, Reload,
 //    Home, Address, Exit.
-//  - Back (Escape) that the page doesn't handle goes back in history; with no
-//    history left it leaves the kiosk (hides it, back to the TV).
+//  - Back (Escape): on the configured apps (TV-ready pages like Novevo) the page
+//    gets it first, and only if it doesn't handle it do we go back or leave. On
+//    other sites (general browsing) Back always goes back: out of fullscreen, to
+//    the previous page, or with no history left, out of the kiosk (back to the TV).
 //  - Pointer mode (wlxbridge, green B) moves the real mouse; the cursor isn't
 //    part of the GPU output, so it is drawn here.
 (() => {
@@ -273,12 +275,32 @@
     },
   };
 
-  // ---- Back that the page doesn't handle ----
+  // ---- Back ----
+  // Is this page one of the configured apps (which handle Back themselves)?
+  let appPage = false;
+  send({ t: 'state' }).then((st) => {
+    appPage = !!(st && st.apps || []).find((a) => {
+      try { return a.id !== 'browser' && new URL(a.url).origin === location.origin; } catch (e) { return false; }
+    });
+  });
+  function backNow() {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else if (window.navigation && navigation.canGoBack) history.back();
+    else leave();
+  }
+  // Apps: Back that the page doesn't handle. A page may also swallow Back
+  // without doing anything visible (Novevo on some screens): a second Back on
+  // the same page, with nothing changed, then goes back or leaves anyway.
+  let lastBack = { href: '', t: 0 };
   function backLater(e) {
     const href = location.href;
     const fullscreen = !!document.fullscreenElement;
+    const again = lastBack.href === href && Date.now() - lastBack.t < 8000;
+    lastBack = { href, t: Date.now() };
     setTimeout(() => {
-      if (e.defaultPrevented || fullscreen || location.href !== href) return; // the page (or the browser) handled it
+      if (fullscreen || location.href !== href) return; // the page (or the browser) handled it
+      if (e.defaultPrevented && !again) return; // e.g. the page closed a dialog
+      lastBack = { href: '', t: 0 };
       if (window.navigation && navigation.canGoBack) history.back();
       else leave();
     }, 250);
@@ -297,7 +319,8 @@
     else if (bar.open) { bar.key(e); mine = true; }
     else if (e.key === 'F13') { bar.show(); mine = true; }
     else if (e.key === 'Enter' && isEditable(document.activeElement)) { osk.show(document.activeElement); mine = true; }
-    else if (e.key === 'Escape') backLater(e);
+    else if (e.key === 'Escape' && appPage) backLater(e);
+    else if (e.key === 'Escape') { backNow(); mine = true; }
     if (mine) { swallowed.add(e.code); swallow(e); }
   }, true);
   for (const type of ['keypress', 'keyup']) {
