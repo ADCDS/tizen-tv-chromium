@@ -12,7 +12,13 @@ KIOSK_TZ=UTC                    # e.g. America/Sao_Paulo
 #KIOSK_GPU=0                    # force software rendering (default: GPU when mgl is installed)
 #KIOSK_W=1920 KIOSK_H=1080 KIOSK_SCALE=2
 
-# Apps the TV helper (tvkioskd) can open, one Chromium tab each:
-#   id|Name|URL|icon|keep-or-discard   (discard: close the tab when leaving, e.g. camera views)
+# Apps the TV helper (tvkioskd) can open, one Chromium tab and one TV tile each:
+#   id|Name|URL|icon|keep-or-discard
+#   id: lowercase letters/digits; icon: PNG/SVG file or URL for the tile (empty: a letter);
+#   discard: close the tab when leaving (e.g. camera views)
 KIOSK_APPS="news|News|https://example.org/||keep;cams|Cameras|http://nvr.local:5000/||discard"
 #KIOSK_SEARCH=https://www.google.com/search?q=%s   # address box searches
+
+# Tiles (tiles/build.sh): the Tizen security profile to sign with, and the CLI.
+#TIZEN_PROFILE=mytv
+#TIZEN_CLI=~/tizen-studio/tools/ide/bin/tizen

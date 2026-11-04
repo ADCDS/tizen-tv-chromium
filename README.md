@@ -16,12 +16,26 @@ Works:
 - Current web apps at 1920×1080, composited and rasterized on the GPU.
 - Video (decoded in software): 1080p plays at 25–30 fps, with a few dropped frames per second at most.
 - Remote: arrows, OK, Back, digits, color and media keys reach the page as keyboard events.
+  When the TV's own UI (Source, Home, another app) is on top, the remote goes back to the TV.
 - Sound through the TV's speakers, in sync with the picture.
+- Apps as TV tiles: each configured web app gets its own tile in the TV's app
+  list. Opening a tile shows that app in its own Chromium tab, starting the
+  kiosk on demand (about 10 s cold, instant afterwards).
+- Leaving with Back or Exit hides Chromium and pauses media, keeping it loaded.
+- Opening the TV's own Internet app opens this browser instead, on a start page
+  with a search/address box.
+- On-screen keyboard, a browser bar, and a pointer mode for sites that need a mouse.
 
-Not yet:
-- Typing text with the remote (only digits work).
-- Starting it from the TV itself; today a PC starts it over SSH.
-- Browser UI (address bar, tabs) and a launcher for web apps.
+## The remote
+
+| Button | In the kiosk |
+|---|---|
+| Arrows, OK | move and select; on pages without their own TV navigation, arrows jump between links |
+| OK on a text field | opens the on-screen keyboard (arrows + OK to type, Back to close, digits type directly) |
+| Back | the page's own Back; with no history left, leave (hide the kiosk, back to the TV) |
+| Red **A** | browser bar: Back, Forward, Reload, Home, Address, Exit |
+| Green **B** | pointer mode: arrows move the mouse, OK clicks, channel up/down scroll, Back ends it |
+| Exit | leave |
 
 ## Requirements
 
@@ -42,9 +56,31 @@ cp tv.conf.example tv.conf      # set TV_HOST, TV_KEY, KIOSK_URL, language, time
 ./mgl/fetch-tv-libs.sh          # copies the TV's GL libraries to link against (not redistributable)
 make -C mgl                     # GPU relay: client (chroot side) + server (TV side)
 ./kiosk/build-image.sh          # Debian armhf + Chromium + Xvfb + wlxbridge -> kiosk/build/rootfs.sqfs
-./kiosk/kiosk install           # copies the image, relay and bridge to the stick
-./kiosk/kiosk start [URL]       # kiosk stop | status; the remote's Exit key also stops it
+./kiosk/kiosk install           # copies the image, relay, bridge, helper, extension and settings to the stick
+./kiosk/kiosk daemon start      # runs the TV helper (tvkioskd) until the next reboot
+./kiosk/kiosk start [URL]       # or start it directly: kiosk stop | status
 ```
+
+The helper (`tvkioskd`) is what the tiles and the Internet takeover talk to. It
+has to run after every TV boot. Add this to whatever already runs at boot on
+your set, with DIR being the stick's `kiosk/` directory:
+
+```sh
+cp DIR/tvkioskd /tmp/ && /tmp/tvkioskd -dir DIR > /tmp/tvkioskd.log 2>&1 &
+```
+
+### Tiles
+
+The tiles are small TV web apps, one per `KIOSK_APPS` entry, that ask the
+helper to show their app. Building them needs the Tizen Studio CLI and a
+certificate profile your TV accepts (`TIZEN_PROFILE` in `tv.conf`):
+
+```sh
+./tiles/build.sh                # tiles/build/<id>.wgt, signed
+./tiles/install.sh              # installs them on the TV (-u removes them)
+```
+
+Then pin them to the home bar from the TV's Apps screen.
 
 Optionally, debloat after each TV boot. This stops telemetry, ads and other
 daemons the TV doesn't need, which frees RAM for Chromium. Either:
@@ -105,12 +141,15 @@ the video frame rate.
 | `mgl/` | GLES2/EGL remoting: client, server, code generator, tests, GPU probe ([details](mgl/README.md)) |
 | `wlxbridge/` | Wayland window, remote input and audio FIFO for the chroot (Go, static) |
 | `debloat/` | stops a Tizen 3.0 TV's non-essential daemons for the current boot (from a PC or a boot hook) |
-| `tvkioskd/` | helper on the TV: opens apps (one tab each), hides/shows the kiosk, starts it on demand |
+| `tvkioskd/` | helper on the TV: opens apps (one tab each), hides/shows the kiosk, starts it on demand, Internet takeover, start page |
+| `kiosk/tvkit/` | Chromium extension: on-screen keyboard, browser bar, Back handling, pointer cursor |
+| `tiles/` | TV app tiles that open the configured apps (template, build, install) |
 | `tools/` | `tvshot` (screenshot of a TV window), `tvkey` (press remote keys), `cdp.mjs` (DevTools) |
 
 ## Debugging
 
 - Logs are on the TV in `/tmp/kiosk/log/`: `chromium.log`, `mgl.log`, `bridge.log`, `xvfb.log`, `pacat.log`.
+  The helper logs to `/tmp/tvkioskd.log`.
 - `tools/tvshot out.png` saves what the TV actually shows, using the compositor's
   own window dump, and prints the window stack.
 - `tools/tvkey down down enter` presses remote keys, the same path as a real press.
@@ -129,8 +168,10 @@ Things that cost time to find out on this TV:
 - The Mali-450 has no `highp` in fragment shaders and no vertex texture units.
   `mgl` papers over both.
 - USB storage is mounted `noexec`, so binaries are copied to tmpfs before they run.
-  Writes to the stick occasionally come back wrong, which is why `kiosk install`
-  verifies checksums.
+- The TV mounts USB ext4 without write barriers. A power cut while Chromium
+  writes its profile can corrupt the filesystem, and with a corrupt block bitmap
+  new writes can land on the image. If `kiosk install` keeps re-copying an
+  unchanged image, run `fsck.ext4` on the partition (kiosk stopped, unmounted).
 
 ## License
 

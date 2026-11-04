@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; color: #dde; font-family: sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  img { width: 180px; height: 180px; object-fit: contain; }
+  p { font-size: 34px; margin-top: 30px; }
+  .err { color: #f0a0a0; font-size: 26px; }
+</style>
+</head>
+<body>
+<img src="logo.png" alt="">
+<p id="msg"></p>
+<script>
+// Tile for one kiosk app: ask the TV helper (tvkioskd) to show the app in the
+// kiosk's Chromium, then get out of the way. The TV's old web engine runs
+// this, so: XMLHttpRequest, no arrow functions.
+(function () {
+  var APP = '@ID@', NAME = '@NAME@';
+  var pt = (navigator.language || '').toLowerCase().indexOf('pt') === 0;
+  var msg = document.getElementById('msg');
+  msg.textContent = (pt ? 'Abrindo ' : 'Opening ') + NAME + '…';
+  function exit() {
+    try { tizen.application.getCurrentApplication().exit(); } catch (e) {}
+  }
+  function fail() {
+    msg.className = 'err';
+    msg.textContent = pt ? 'Não foi possível abrir: o assistente da TV (tvkioskd) não está rodando.'
+                         : 'Could not open it: the TV helper (tvkioskd) is not running.';
+    setTimeout(exit, 8000);
+  }
+  document.addEventListener('keydown', function (e) {
+    if (e.keyCode === 10009) exit(); // Back
+  });
+  var x = new XMLHttpRequest();
+  x.open('GET', 'http://127.0.0.1:7770/open?app=' + encodeURIComponent(APP));
+  x.timeout = 180000; // a cold start of the kiosk takes about 10-20 s
+  x.onload = function () { if (x.status === 200) exit(); else fail(); };
+  x.onerror = x.ontimeout = fail;
+  x.send();
+})();
+</script>
+</body>
+</html>
