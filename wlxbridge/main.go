@@ -237,9 +237,29 @@ func holdAudioFifo(path string) {
 
 // ---- main ----
 
+// TV keymap codes the keyer treats specially.
+const (
+	keyBack    = 9
+	keyOK      = 36
+	keyGreen   = 68 // toggles pointer mode
+	keyChDown  = 95
+	keyChUp    = 96
+	keyUp      = 111
+	keyLeft    = 113
+	keyRight   = 114
+	keyDown    = 116
+	xF13       = 191 // Xvfb keycodes given the keysyms F13..F16 at start-up:
+	xF15       = 193 // the red/yellow/blue keys arrive in pages as F13/F15/F16,
+	xF16       = 194 // which Chromium has no shortcuts for (F1..F4 would open help etc.)
+	pointerTap = 10  // pixels for a tap; held, the pointer moves every 30 ms after 200 ms,
+	pointerMin = 4   // starting at pointerMin pixels per step and growing to pointerMax
+	pointerMax = 40
+)
+
 // keyer replays the remote's keys (TV keymap codes, evdev + 8) into X through
 // XTEST, with auto-repeat for the arrows and channel keys. Keys only go through
-// while our window has keyboard focus.
+// while our window has keyboard focus. In pointer mode (green key) the arrows
+// move the mouse, OK clicks and channel up/down scroll.
 type keyer struct {
 	xc          *xgb.Conn
 	root        xproto.Window
@@ -252,6 +272,11 @@ type keyer struct {
 	repeatKey   uint32
 	timer       *time.Timer
 	onExit      func()
+	scrW, scrH  int16
+	pointer     bool
+	held        map[uint32]bool // arrows held in pointer mode
+	step        int
+	ptimer      *time.Timer
 }
 
 func (k *keyer) fake(press bool, code uint32) {
@@ -273,6 +298,15 @@ func (k *keyer) key(code uint32, down bool) {
 	if !k.focused {
 		return
 	}
+	if code == keyGreen {
+		if down {
+			k.setPointer(!k.pointer)
+		}
+		return
+	}
+	if k.pointer && k.pointerKey(code, down) {
+		return
+	}
 	x := code
 	if m, ok := k.remap[code]; ok {
 		x = m
@@ -287,6 +321,79 @@ func (k *keyer) key(code uint32, down bool) {
 	}
 }
 
+func (k *keyer) setPointer(on bool) {
+	k.pointer = on
+	k.held = map[uint32]bool{}
+	k.ptimer.Stop()
+	if on { // start in the middle of the screen
+		xtest.FakeInput(k.xc, xproto.MotionNotify, 0, 0, k.root, k.scrW/2, k.scrH/2, 0)
+	} else { // park it in the corner, where the page hides the cursor
+		xtest.FakeInput(k.xc, xproto.MotionNotify, 0, 0, k.root, k.scrW-1, k.scrH-1, 0)
+	}
+	log.Printf("pointer mode %v", on)
+}
+
+// pointerKey handles a key in pointer mode; false means "not a pointer key".
+func (k *keyer) pointerKey(code uint32, down bool) bool {
+	button := func(b byte) {
+		t := byte(xproto.ButtonRelease)
+		if down {
+			t = xproto.ButtonPress
+		}
+		xtest.FakeInput(k.xc, t, b, 0, k.root, 0, 0, 0)
+	}
+	switch code {
+	case keyUp, keyDown, keyLeft, keyRight:
+		if down && !k.held[code] {
+			k.held[code] = true
+			k.step = pointerTap
+			k.pointerTick()
+			k.step = pointerMin
+			k.ptimer.Reset(200 * time.Millisecond)
+		} else if !down {
+			delete(k.held, code)
+		}
+	case keyOK:
+		button(1)
+	case keyChUp:
+		button(4) // wheel up
+	case keyChDown:
+		button(5) // wheel down
+	case keyBack:
+		if down {
+			k.setPointer(false)
+		}
+	default:
+		return false
+	}
+	return true
+}
+
+// pointerTick moves the pointer while arrows are held, accelerating.
+func (k *keyer) pointerTick() {
+	var dx, dy int
+	if k.held[keyLeft] {
+		dx -= k.step
+	}
+	if k.held[keyRight] {
+		dx += k.step
+	}
+	if k.held[keyUp] {
+		dy -= k.step
+	}
+	if k.held[keyDown] {
+		dy += k.step
+	}
+	if dx == 0 && dy == 0 {
+		return
+	}
+	xtest.FakeInput(k.xc, xproto.MotionNotify, 1 /* relative */, 0, k.root, int16(dx), int16(dy), 0)
+	if k.step < pointerMax {
+		k.step += 2
+	}
+	k.ptimer.Reset(30 * time.Millisecond) // pointerKey re-arms it to 200 ms after a tap's first move
+}
+
 func (k *keyer) setFocus(f bool) {
 	if f == k.focused {
 		return
@@ -296,6 +403,9 @@ func (k *keyer) setFocus(f bool) {
 		k.fake(false, k.repeatKey)
 		k.repeatKey = 0
 		k.timer.Stop()
+	}
+	if !f && k.pointer {
+		k.setPointer(false)
 	}
 	log.Printf("keyboard focus %v", map[bool]string{true: "in", false: "out"}[f])
 }
@@ -348,6 +458,8 @@ func runKeysSocket(k *keyer, path string, sig <-chan os.Signal) {
 			return
 		case <-k.timer.C:
 			k.repeat()
+		case <-k.ptimer.C:
+			k.pointerTick()
 		case l := <-lines:
 			f := strings.Fields(l)
 			switch {
@@ -391,11 +503,14 @@ func main() {
 
 	// TV keymap -> Xvfb (evdev rules) keycode, where they differ.
 	remap := map[uint32]uint32{
-		95:  117, // XF86LowerChannel -> Next (PageDown)
-		96:  112, // XF86RaiseChannel -> Prior (PageUp)
-		176: 113, // XF86AudioRewind -> Left (player seeks on arrows)
-		216: 114, // XF86AudioNext (FF) -> Right
-		252: 172, // XF86PlayBack -> XF86AudioPlay (MediaPlayPause)
+		95:  117,  // XF86LowerChannel -> Next (PageDown)
+		96:  112,  // XF86RaiseChannel -> Prior (PageUp)
+		176: 113,  // XF86AudioRewind -> Left (player seeks on arrows)
+		216: 114,  // XF86AudioNext (FF) -> Right
+		252: 172,  // XF86PlayBack -> XF86AudioPlay (MediaPlayPause)
+		67:  xF13, // red A -> F13 (the kiosk's browser bar)
+		69:  xF15, // yellow C -> F15
+		70:  xF16, // blue D -> F16
 	}
 	repeatable := map[uint32]bool{111: true, 113: true, 114: true, 116: true, 95: true, 96: true}
 
@@ -417,9 +532,14 @@ func main() {
 	xtest.FakeInput(xc, xproto.MotionNotify, 0, 0, root, int16(scr.WidthInPixels-1), int16(scr.HeightInPixels-1), 0)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	// Give the color keys' X keycodes the keysyms F13..F16 (the default evdev
+	// keymap has launcher keys there).
+	xproto.ChangeKeyboardMapping(xc, 4, xF13, 1, []xproto.Keysym{0xffca, 0xffcb, 0xffcc, 0xffcd}) // F13..F16
 	k := &keyer{xc: xc, root: root, remap: remap, repeatable: repeatable, exitKey: uint32(*exitKey), verbose: *verbose,
-		delay: 400 * time.Millisecond, rate: 50 * time.Millisecond, timer: time.NewTimer(time.Hour)}
+		delay: 400 * time.Millisecond, rate: 50 * time.Millisecond, timer: time.NewTimer(time.Hour),
+		scrW: int16(scr.WidthInPixels), scrH: int16(scr.HeightInPixels), held: map[uint32]bool{}, ptimer: time.NewTimer(time.Hour)}
 	k.timer.Stop()
+	k.ptimer.Stop()
 	k.onExit = func() {
 		if *leave != "" {
 			log.Print("exit key: leaving")
@@ -649,6 +769,8 @@ func main() {
 			}
 		case <-k.timer.C:
 			k.repeat()
+		case <-k.ptimer.C:
+			k.pointerTick()
 		case ev := <-events:
 			switch {
 			case ev.obj == idDisplay && ev.op == 0:

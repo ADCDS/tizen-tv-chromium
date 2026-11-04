@@ -11,6 +11,8 @@
 #   KIOSK_SCALE  device scale factor (default 2: pages lay out at 960x540 CSS pixels)
 #   KIOSK_LANG   Chromium UI and Accept-Language, e.g. pt_BR (default en_US)
 #   KIOSK_TZ     time zone, e.g. America/Sao_Paulo (default UTC)
+#   KIOSK_SPATNAV 1 (default): arrow keys move between links on pages without their own
+#                key handling (Chromium's spatial navigation); 0: off
 #   KIOSK_LEAVE  host:port of the TV helper (tvkioskd): the remote's Exit key asks it
 #                to hide the kiosk instead of stopping it
 set -u
@@ -63,6 +65,9 @@ up() {
   mounted "$R/data" || mount --bind "$dir/data" "$R/data"
   mounted "$R/etc/resolv.conf" || mount --bind /opt/etc/resolv.conf "$R/etc/resolv.conf"
   mounted "$R/etc/hosts" || mount --bind /etc/hosts "$R/etc/hosts"
+  # Extensions (tvkit) live on the stick, so updating them never rewrites the image.
+  mkdir -p "$dir/opt"
+  mounted "$R/opt" || mount --bind "$dir/opt" "$R/opt"
   # Managed policies: no bubbles that would steal the remote's focus. The image
   # is read-only and has no policies/ dir, so /etc/chromium comes from the stick.
   if ! mounted "$R/etc/chromium"; then
@@ -96,7 +101,7 @@ stop() {
     for _ in $(seq 25); do [ -z "$(inroot)" ] && break; sleep 0.2; done
     pids=$(inroot); [ -n "$pids" ] && kill -9 $pids 2>/dev/null
   fi
-  for m in etc/chromium etc/hosts etc/resolv.conf data run/wayland-0 run/pulse run tmp dev/shm dev sys proc ""; do
+  for m in opt etc/chromium etc/hosts etc/resolv.conf data run/wayland-0 run/pulse run tmp dev/shm dev sys proc ""; do
     mounted "$R${m:+/$m}" && { umount "$R${m:+/$m}" 2>/dev/null || umount -l "$R${m:+/$m}"; }
   done
   return 0
@@ -171,6 +176,10 @@ ALSA
     gl_flags="--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-watchdog"
     feat="$feat,FallbackToSWIfGLES3NotSupported"
   fi
+  # tvkit (on-screen keyboard, browser bar, Back handling, cursor) from the stick.
+  ext_flags=""
+  [ -f "$R/opt/tvkit/manifest.json" ] && ext_flags="--load-extension=/opt/tvkit"
+  [ "${KIOSK_SPATNAV:-1}" = 1 ] && ext_flags="$ext_flags --enable-spatial-navigation"
   # --window-size is in DIPs (scaled by the device scale factor), so divide,
   # or the window overflows the screen and the right/bottom of the page is cut.
   wd=$(awk -v v="$W" -v s="$SCALE" 'BEGIN { printf "%d", v / s + 0.5 }')
@@ -183,7 +192,7 @@ ALSA
     --no-first-run --no-default-browser-check --noerrdialogs --disable-infobars \
     --password-store=basic --disable-background-networking --disable-component-update --disable-breakpad \
     --disable-features="$feat" \
-    --renderer-process-limit=2 --hide-scrollbars \
+    --renderer-process-limit=2 --hide-scrollbars $ext_flags \
     --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 "$url" </dev/null >"$L/chromium.log" 2>&1 &
   while kill -0 "$bridge" 2>/dev/null; do sleep 2; done # Exit key -> bridge exits
   echo "bridge exited; stopping"

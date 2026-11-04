@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "tvkit",
+  "version": "1.0",
+  "description": "Remote-control helpers for the TV kiosk: on-screen keyboard, browser bar, Back handling, pointer cursor.",
+  "background": { "service_worker": "sw.js" },
+  "host_permissions": ["http://127.0.0.1:7770/*"],
+  "content_scripts": [
+    { "matches": ["<all_urls>"], "js": ["tvkit.js"], "run_at": "document_start" },
+    { "matches": ["<all_urls>"], "js": ["main-world.js"], "run_at": "document_start", "world": "MAIN" }
+  ]
+}

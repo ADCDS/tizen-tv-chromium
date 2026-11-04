@@ -8,6 +8,8 @@
 //	GET  /state        JSON: current app, running, visible, apps
 //	GET  /start        the browser's start page
 //
+// Opening the TV's own web browser opens the kiosk's browser instead (-takeover).
+//
 // It listens on 127.0.0.1 only. Settings, written by `kiosk install` into the
 // kiosk directory on the stick: kiosk.env (KIOSK_* for kiosk-tv.sh) and
 // apps.json. kiosk-tv.sh from that directory is fed to bash on stdin.
@@ -126,6 +128,7 @@ func (d *daemon) leave() {
 
 func main() {
 	dir := flag.String("dir", "", "kiosk directory on the stick (default: kiosk/ on the partition labelled tvchrome)")
+	takeoverApp := flag.String("takeover", "org.tizen.browser", "TV app replaced by the kiosk's browser when opened (empty: none)")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	if *dir == "" {
@@ -136,6 +139,9 @@ func main() {
 	d := &daemon{dir: *dir, win: newWindow(chroot + "/tmp/mglwin.sock"), tabs: newTabs()}
 	d.win.onHidden = func() { go d.tabs.pauseAll() } // covered by the TV's own UI or another app
 	go d.win.run()
+	if *takeoverApp != "" {
+		go d.takeover(*takeoverApp)
+	}
 
 	start, _ := fs.Sub(startFiles, "start")
 	mux := http.NewServeMux()
