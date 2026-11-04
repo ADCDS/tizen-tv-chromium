@@ -52,3 +52,6 @@ void plat_before_swap(struct ssurface *s) {
 	free(px);
 }
 void plat_after_swap(struct ssurface *s) { (void)s; }
+int plat_window_visible(void *win) { (void)win; return 1; }
+int plat_poll_fds(struct pollfd *pf, int max) { (void)pf, (void)max; return 0; }
+void plat_poll_ready(struct pollfd *pf, int n) { (void)pf, (void)n; }

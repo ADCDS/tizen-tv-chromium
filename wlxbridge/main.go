@@ -3,6 +3,11 @@
 // Chromium can't open a window there itself) and feeds the remote's keys into
 // X through XTEST.
 //
+// GPU mode (-keys-socket): Chromium's frames go to mgl-server's window, which
+// also owns the remote (its window is the one on screen). The bridge then has
+// no window of its own: it reads "key <evdev> <0|1>" and "focus <0|1>" lines
+// from mgl-server's window socket and replays them into X.
+//
 // Frames: Xvfb -fbdir exposes the screen as an XWD file; we mmap it and, when
 // XDamage reports a change, copy it into a wl_shm buffer. The copy also sets
 // every pixel's alpha byte: the TV blends the graphics plane over the video
@@ -10,6 +15,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -231,6 +237,130 @@ func holdAudioFifo(path string) {
 
 // ---- main ----
 
+// keyer replays the remote's keys (TV keymap codes, evdev + 8) into X through
+// XTEST, with auto-repeat for the arrows and channel keys. Keys only go through
+// while our window has keyboard focus.
+type keyer struct {
+	xc          *xgb.Conn
+	root        xproto.Window
+	remap       map[uint32]uint32
+	repeatable  map[uint32]bool
+	exitKey     uint32
+	verbose     bool
+	focused     bool
+	delay, rate time.Duration
+	repeatKey   uint32
+	timer       *time.Timer
+	onExit      func()
+}
+
+func (k *keyer) fake(press bool, code uint32) {
+	t := byte(xproto.KeyRelease)
+	if press {
+		t = xproto.KeyPress
+	}
+	xtest.FakeInput(k.xc, t, byte(code), 0, k.root, 0, 0, 0)
+}
+
+func (k *keyer) key(code uint32, down bool) {
+	if k.verbose {
+		log.Printf("key %d %v focused=%v", code, down, k.focused)
+	}
+	if code == k.exitKey && !down {
+		k.onExit()
+		return
+	}
+	if !k.focused {
+		return
+	}
+	x := code
+	if m, ok := k.remap[code]; ok {
+		x = m
+	}
+	k.fake(down, x)
+	if down && k.repeatable[code] {
+		k.repeatKey = x
+		k.timer.Reset(k.delay)
+	} else if !down && k.repeatKey == x {
+		k.repeatKey = 0
+		k.timer.Stop()
+	}
+}
+
+func (k *keyer) setFocus(f bool) {
+	if f == k.focused {
+		return
+	}
+	k.focused = f
+	if !f && k.repeatKey != 0 { // don't leave a held key down in X
+		k.fake(false, k.repeatKey)
+		k.repeatKey = 0
+		k.timer.Stop()
+	}
+	log.Printf("keyboard focus %v", map[bool]string{true: "in", false: "out"}[f])
+}
+
+func (k *keyer) repeat() {
+	if k.repeatKey != 0 && k.focused {
+		k.fake(true, k.repeatKey)
+		k.timer.Reset(k.rate)
+	}
+}
+
+// postLeave asks the kiosk helper (host:port) to hide the kiosk: POST /leave.
+func postLeave(addr string) {
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		log.Printf("leave: %v", err)
+		return
+	}
+	defer c.Close()
+	fmt.Fprintf(c, "POST /leave HTTP/1.0\r\nHost: %s\r\nContent-Length: 0\r\n\r\n", addr)
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	bufio.NewReader(c).ReadString('\n')
+}
+
+// runKeysSocket is GPU mode: keys come from mgl-server's window socket.
+func runKeysSocket(k *keyer, path string, sig <-chan os.Signal) {
+	lines := make(chan string, 64)
+	go func() {
+		for {
+			c, err := net.Dial("unix", path)
+			if err != nil {
+				time.Sleep(time.Second)
+				continue
+			}
+			log.Printf("keys from %s", path)
+			sc := bufio.NewScanner(c)
+			for sc.Scan() {
+				lines <- sc.Text()
+			}
+			c.Close()
+			lines <- "focus 0"
+			log.Print("keys socket closed, reconnecting")
+			time.Sleep(time.Second)
+		}
+	}()
+	for {
+		select {
+		case <-sig:
+			log.Print("signal, exiting")
+			return
+		case <-k.timer.C:
+			k.repeat()
+		case l := <-lines:
+			f := strings.Fields(l)
+			switch {
+			case len(f) == 3 && f[0] == "key":
+				code, _ := strconv.Atoi(f[1])
+				k.key(uint32(code)+8, f[2] == "1")
+			case len(f) == 2 && f[0] == "focus":
+				k.setFocus(f[1] == "1")
+			}
+		}
+	}
+}
+
 func parseCodes(s string) []uint32 {
 	var out []uint32
 	for _, f := range strings.Split(s, ",") {
@@ -253,9 +383,8 @@ func main() {
 		"X keycodes (TV keymap) to grab from the TV via tizen_keyrouter")
 	exitKey := flag.Uint("exit-key", 182, "keycode that quits (XF86Exit)")
 	verbose := flag.Bool("v", false, "log every key")
-	grabMode := flag.Uint("grab-mode", 2, "tizen_keyrouter grab mode: 2 topmost (our window on top), 3 overridable exclusive (another window, e.g. the mgl GPU window, is on top)")
-	noFrames := flag.Bool("no-frames", false, "show a 1x1 surface instead of the Xvfb screen (GPU mode: Chromium's frames go to the mgl window; this one only holds key grabs)")
-	anyFocus := flag.Bool("any-focus", false, "forward keys even without keyboard focus (when another window of ours, the GPU window, holds it)")
+	keysSocket := flag.String("keys-socket", "", "GPU mode: take keys from mgl-server's window socket and show no window")
+	leave := flag.String("leave", "", "on the exit key, POST /leave to this kiosk helper (host:port) instead of quitting")
 	audioFifo := flag.String("audio-fifo", "", "create and hold open this FIFO for the audio relay (Chromium/ALSA writes it, the TV's native pacat reads it)")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -274,24 +403,44 @@ func main() {
 		holdAudioFifo(*audioFifo)
 	}
 
-	var fb *xwd
-	if *noFrames {
-		fb = &xwd{w: 1, h: 1, stride: 4, bitsPerPixel: 32, pix: make([]byte, 4)}
-		*outW, *outH = 1, 1
-	} else {
-		var err error
-		if fb, err = openXWD(*fbPath); err != nil {
-			log.Fatalf("framebuffer: %v", err)
-		}
-	}
-	log.Printf("xvfb framebuffer %dx%d stride %d", fb.w, fb.h, fb.stride)
-
-	// X: XDamage for change detection, XTEST for keys.
+	// X: XTEST for keys (and, in window mode, XDamage for change detection).
 	xc, err := xgb.NewConnDisplay(*display)
 	if err != nil {
 		log.Fatalf("X connect %s: %v", *display, err)
 	}
-	for _, init := range []func(*xgb.Conn) error{xfixes.Init, damage.Init, xtest.Init} {
+	if err := xtest.Init(xc); err != nil {
+		log.Fatalf("X extension: %v", err)
+	}
+	root := xproto.Setup(xc).DefaultScreen(xc).Root
+	// Park the pointer in the bottom-right corner so the cursor stays out of view.
+	scr := xproto.Setup(xc).DefaultScreen(xc)
+	xtest.FakeInput(xc, xproto.MotionNotify, 0, 0, root, int16(scr.WidthInPixels-1), int16(scr.HeightInPixels-1), 0)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	k := &keyer{xc: xc, root: root, remap: remap, repeatable: repeatable, exitKey: uint32(*exitKey), verbose: *verbose,
+		delay: 400 * time.Millisecond, rate: 50 * time.Millisecond, timer: time.NewTimer(time.Hour)}
+	k.timer.Stop()
+	k.onExit = func() {
+		if *leave != "" {
+			log.Print("exit key: leaving")
+			go postLeave(*leave)
+			return
+		}
+		log.Print("exit key, exiting")
+		os.Exit(0)
+	}
+	if *keysSocket != "" {
+		log.Printf("up: keys from %s", *keysSocket)
+		runKeysSocket(k, *keysSocket, sig)
+		return
+	}
+
+	fb, err := openXWD(*fbPath)
+	if err != nil {
+		log.Fatalf("framebuffer: %v", err)
+	}
+	log.Printf("xvfb framebuffer %dx%d stride %d", fb.w, fb.h, fb.stride)
+	for _, init := range []func(*xgb.Conn) error{xfixes.Init, damage.Init} {
 		if err := init(xc); err != nil {
 			log.Fatalf("X extension: %v", err)
 		}
@@ -302,14 +451,10 @@ func main() {
 	if _, err := damage.QueryVersion(xc, 1, 1).Reply(); err != nil {
 		log.Fatalf("damage: %v", err)
 	}
-	root := xproto.Setup(xc).DefaultScreen(xc).Root
 	dmg, _ := damage.NewDamageId(xc)
 	if err := damage.CreateChecked(xc, dmg, xproto.Drawable(root), damage.ReportLevelNonEmpty).Check(); err != nil {
 		log.Fatalf("damage create: %v", err)
 	}
-	// Park the pointer in the bottom-right corner so the cursor stays out of view.
-	scr := xproto.Setup(xc).DefaultScreen(xc)
-	xtest.FakeInput(xc, xproto.MotionNotify, 0, 0, root, int16(scr.WidthInPixels-1), int16(scr.HeightInPixels-1), 0)
 	dirty := make(chan struct{}, 1)
 	go func() {
 		for {
@@ -406,7 +551,7 @@ func main() {
 	}
 	idShellSurf = alloc()
 	w.send(idShell, 0, -1, idShellSurf, idSurface)
-	w.send(idShellSurf, 3, -1)           // set_toplevel
+	w.send(idShellSurf, 3, -1)             // set_toplevel
 	w.send(idShellSurf, 8, -1, "Chromium") // set_title
 	if scale {
 		idViewport = alloc()
@@ -417,7 +562,7 @@ func main() {
 	w.send(idSeat, 1, -1, idKeyboard) // get_keyboard
 	if haveKeyrouter {
 		for _, k := range parseCodes(*grab) {
-			w.send(idKeyrouter, 0, -1, uint32(idSurface), k, uint32(*grabMode)) // set_keygrab
+			w.send(idKeyrouter, 0, -1, uint32(idSurface), k, uint32(2)) // set_keygrab, topmost
 		}
 	} else {
 		log.Print("no tizen_keyrouter: remote keys will mostly go to the TV")
@@ -437,23 +582,8 @@ func main() {
 	// timeout in case the surface is hidden and callbacks stop.
 	var frameCB uint32
 	var frameSent time.Time
-	focused := false
-	repeatDelay, repeatRate := 400*time.Millisecond, 50*time.Millisecond
-	var repeatKey uint32
-	repeatTimer := time.NewTimer(time.Hour)
-	repeatTimer.Stop()
 	ticker := time.NewTicker(time.Second / time.Duration(*fps))
 	pending := false
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-
-	fake := func(press bool, code uint32) {
-		t := byte(xproto.KeyRelease)
-		if press {
-			t = xproto.KeyPress
-		}
-		xtest.FakeInput(xc, t, byte(code), 0, root, 0, 0, 0)
-	}
 	// Stats (logged every 10 s with -v): what limits the frame rate?
 	frames, damages, blocked, cbWaits := 0, 0, 0, 0
 	var copyTime, releaseWait time.Duration
@@ -517,11 +647,8 @@ func main() {
 				frames, damages, blocked, cbWaits, releases, lastStat = 0, 0, 0, 0, 0, time.Now()
 				copyTime, releaseWait = 0, 0
 			}
-		case <-repeatTimer.C:
-			if repeatKey != 0 && (focused || *anyFocus) {
-				fake(true, repeatKey)
-				repeatTimer.Reset(repeatRate)
-			}
+		case <-k.timer.C:
+			k.repeat()
 		case ev := <-events:
 			switch {
 			case ev.obj == idDisplay && ev.op == 0:
@@ -544,44 +671,17 @@ func main() {
 					syscall.Close(ev.fd)
 				}
 			case ev.obj == idKeyboard && ev.op == 1:
-				focused = true
-				log.Print("keyboard focus in")
+				k.setFocus(true)
 			case ev.obj == idKeyboard && ev.op == 2:
-				focused = false
-				repeatKey = 0
-				repeatTimer.Stop()
-				log.Print("keyboard focus out")
+				k.setFocus(false)
 			case ev.obj == idKeyboard && ev.op == 3: // key(serial, time, key, state)
-				code := le.Uint32(ev.body[8:]) + 8
-				down := le.Uint32(ev.body[12:]) == 1
-				if *verbose {
-					log.Printf("key %d %v focused=%v", code, down, focused)
-				}
-				if code == uint32(*exitKey) && !down {
-					log.Print("exit key, exiting")
-					return
-				}
-				if !focused && !*anyFocus {
-					break
-				}
-				x := code
-				if m, ok := remap[code]; ok {
-					x = m
-				}
-				fake(down, x)
-				if down && repeatable[code] {
-					repeatKey = x
-					repeatTimer.Reset(repeatDelay)
-				} else if !down && repeatKey == x {
-					repeatKey = 0
-					repeatTimer.Stop()
-				}
+				k.key(le.Uint32(ev.body[8:])+8, le.Uint32(ev.body[12:]) == 1)
 			case ev.obj == idKeyboard && ev.op == 5: // repeat_info(rate, delay)
 				if rate := int32(le.Uint32(ev.body)); rate > 0 {
-					repeatRate = time.Second / time.Duration(rate)
+					k.rate = time.Second / time.Duration(rate)
 				}
 				if d := int32(le.Uint32(ev.body[4:])); d > 0 {
-					repeatDelay = time.Duration(d) * time.Millisecond
+					k.delay = time.Duration(d) * time.Millisecond
 				}
 			case ev.obj == idKeyrouter && ev.op == 0: // keygrab_notify
 				if e := le.Uint32(ev.body[12:]); e != 0 && *verbose {

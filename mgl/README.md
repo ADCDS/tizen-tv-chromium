@@ -65,6 +65,27 @@ queries, shader sources, and draws with client-side arrays.
 - **Alpha.** The TV blends graphics over video by alpha. Before each swap the
   server forces the window's alpha to 1 (`MGL_KEEP_ALPHA=1` turns that off).
 
+## Window control (kiosk GPU mode)
+
+In GPU mode the relay's window is the one on screen, so it also owns the remote.
+This is enabled with `MGL_WINDOW_SOCKET`:
+- **Keys.** It grabs `MGL_GRAB_KEYS` (TV keymap codes) through `tizen_keyrouter`
+  in *topmost* mode. Keys reach us only while our window is on top. When the TV's
+  own UI (Source, Home, another app) covers it, the keys go back to the TV.
+- **Socket output.** Clients of the socket get these lines:
+  - `key <evdev> <0|1>`
+  - `focus <0|1>`
+  - `visible <0|1>`, from `tizen_visibility`
+- **Socket input.** Clients may send `show` or `hide` (`tizen_policy`
+  uniconify+activate / iconify).
+- **Hidden window.** Swaps are skipped while the window is hidden or fully
+  covered. The compositor sends no frame callbacks then, so a swap would block
+  the whole server.
+
+The Tizen protocols are loaded at run time from the TV's
+`libtizen-extension-client.so.0`, and requests are looked up by name.
+`wlxbridge -keys-socket` replays the keys into X.
+
 ## Settings and debugging (environment)
 
 | Variable | Side | Effect |
@@ -77,6 +98,8 @@ queries, shader sources, and draws with client-side arrays.
 | `MGL_OUTPUT_SIZE` | server | scale the window to `WxH` on screen (`wl_scaler`) |
 | `MGL_FENCE_FINISH=1` | server | fences wait for the GPU (`glFinish`) |
 | `MGL_KEEP_ALPHA=1` | server | don't force opaque alpha before swaps |
+| `MGL_WINDOW_SOCKET` | server (TV) | window control socket: keys, focus, visibility, show/hide |
+| `MGL_GRAB_KEYS` | server (TV) | comma-separated TV keymap codes to grab while our window is on top |
 | `MGL_DUMP_DIR`, `MGL_DUMP_EVERY` | PC server | write every Nth frame as PPM |
 
 `../kiosk/kiosk` passes `MGL_CHECK`, `MGL_TRACE`, `MGL_OUTPUT_SIZE` and

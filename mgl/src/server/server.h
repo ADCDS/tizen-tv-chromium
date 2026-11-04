@@ -4,6 +4,7 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -58,6 +59,10 @@ void plat_resize_window(void *win, int w, int h);
 void plat_destroy_window(void *win);
 void plat_before_swap(struct ssurface *s); /* e.g. PC: dump the frame for checking */
 void plat_after_swap(struct ssurface *s);   /* e.g. TV: dispatch Wayland events */
+int plat_window_visible(void *win);          /* 0: hidden or covered, skip swaps */
+#define PLAT_MAX_FDS 12
+int plat_poll_fds(struct pollfd *pf, int max); /* fds for the server's poll loop */
+void plat_poll_ready(struct pollfd *pf, int n); /* after poll: handle what's ready */
 
 extern int verbose;
 #endif

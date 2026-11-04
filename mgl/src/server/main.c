@@ -331,7 +331,9 @@ static void handle(uint16_t op, struct mgl_reader *r) {
 	case MGL_OP_EGL_SWAP: {
 		struct ssurface *s = surf_get(mgl_u32(r));
 		int ok = 0;
-		if (s) {
+		if (s && s->win && !plat_window_visible(s->win)) {
+			ok = 1; /* hidden: no frame callbacks would come, so don't wait for one */
+		} else if (s) {
 			plat_before_swap(s);
 			ok = eglSwapBuffers(dpy, s->egl);
 			if (verbose && !ok) fprintf(stderr, "mgl: eglSwapBuffers FAILED 0x%x\n", eglGetError());
@@ -420,15 +422,21 @@ static int serve(int lfd, int cfd) {
 	unsigned long nmsg = 0;
 	int next = -1;
 	for (;;) {
-		struct pollfd pf[2] = {{cfd, POLLIN, 0}, {lfd, POLLIN, 0}};
-		if (poll(pf, 2, -1) < 0) {
+		/* cfd < 0: no client yet (poll skips it); platform fds are always watched. */
+		struct pollfd pf[2 + PLAT_MAX_FDS] = {{cfd, POLLIN, 0}, {lfd, POLLIN, 0}};
+		int np = 2 + plat_poll_fds(pf + 2, PLAT_MAX_FDS);
+		int pr = poll(pf, (nfds_t)np, -1);
+		if (pr < 0)
+			for (int i = 0; i < np; i++) pf[i].revents = 0;
+		plat_poll_ready(pf + 2, np - 2);
+		if (pr < 0) {
 			if (errno == EINTR) continue;
 			break;
 		}
 		if (pf[1].revents & POLLIN) {
 			next = accept(lfd, NULL, NULL);
 			if (next >= 0) {
-				if (verbose) fprintf(stderr, "mgl: new client replaces the current one\n");
+				if (verbose && cfd >= 0) fprintf(stderr, "mgl: new client replaces the current one\n");
 				break;
 			}
 		}
@@ -478,7 +486,7 @@ static int serve(int lfd, int cfd) {
 			if (write_all(cfd, &rlen, 4) || (rlen && write_all(cfd, rbuf, rlen))) break;
 		}
 	}
-	if (verbose) fprintf(stderr, "mgl: client gone after %lu messages\n", nmsg);
+	if (verbose && cfd >= 0) fprintf(stderr, "mgl: client gone after %lu messages\n", nmsg);
 	return next;
 }
 
@@ -536,12 +544,9 @@ int main(int argc, char **argv) {
 	chmod(path, 0777);
 	int cfd = -1;
 	for (;;) {
-		if (cfd < 0) cfd = accept(lfd, NULL, NULL);
-		if (cfd < 0) continue;
-		if (verbose) fprintf(stderr, "mgl: client connected\n"), log_maps();
-		int next = serve(lfd, cfd);
-		close(cfd);
-		reset_session();
+		int next = serve(lfd, cfd); /* returns the next client (or -1) when this one ends */
+		if (cfd >= 0) close(cfd), reset_session();
 		cfd = next;
+		if (cfd >= 0 && verbose) fprintf(stderr, "mgl: client connected\n"), log_maps();
 	}
 }

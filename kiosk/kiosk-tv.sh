@@ -16,6 +16,11 @@ R=/tmp/kiosk/root
 L=/tmp/kiosk/log # outside the chroot so logs survive stop
 W=${KIOSK_W:-1920} H=${KIOSK_H:-1080} SCALE=${KIOSK_SCALE:-2}
 LANG_UI=${KIOSK_LANG:-en_US} TZ_UI=${KIOSK_TZ:-UTC}
+# Remote keys the kiosk takes from the TV (TV keymap codes): Back, digits, OK,
+# color keys, channel up/down, arrows, media keys, Exit. Grabbed in "topmost"
+# mode by whichever process owns the window on screen, so they go back to the
+# TV whenever its own UI (Source, Home, other apps) is on top.
+KEYS=9,10,11,12,13,14,15,16,17,18,19,36,67,68,69,70,95,96,111,113,114,116,174,176,182,208,209,216,252
 UA="Mozilla/5.0 (SMART-TV; Linux; Tizen 3.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
 mounted() { grep -q " $1 " /proc/mounts; }
@@ -115,10 +120,11 @@ run() { # foreground: start everything, wait for the bridge, then tear down
   if [ "${KIOSK_NOBRIDGE:-0}" = 1 ]; then # test only: no input/audio bridge window
     sleep 100000 & bridge=$!
   else
-    # In GPU mode the mgl window sits on top and holds keyboard focus, so the
-    # bridge grabs keys overridable-exclusively and forwards them unfocused.
-    bridge_keys=""
-    [ "$gpu" = 1 ] && bridge_keys="-grab-mode 3 -any-focus -no-frames"
+    # GPU mode: mgl-server's window is the one on screen, so it grabs the keys
+    # and passes them to the bridge over its window socket; the bridge shows no
+    # window. Software mode: the bridge's own window shows Xvfb and grabs them.
+    bridge_keys="-grab $KEYS"
+    [ "$gpu" = 1 ] && bridge_keys="-keys-socket /tmp/mglwin.sock"
     ch "$bridge_bin" -display :1 -fb /tmp/Xvfb_screen0 -wayland /run/wayland-0 -audio-fifo /tmp/audio.fifo -v $bridge_keys \
       </dev/null >"$L/bridge.log" 2>&1 &
     bridge=$!
@@ -155,7 +161,8 @@ ALSA
     mkdir -p "$R/tmp/mgl"
     cp "$dir/libmgl.so" "$R/tmp/mgl/libEGL.so.1"
     cp "$dir/mgl-server" "$L/mgl-server" && chmod 755 "$L/mgl-server"
-    MGL_RING="$L/mgl.ring" XDG_RUNTIME_DIR=/run "$L/mgl-server" "$R/tmp/mgl.sock" -v </dev/null >"$L/mgl.log" 2>&1 &
+    MGL_RING="$L/mgl.ring" MGL_WINDOW_SOCKET="$R/tmp/mglwin.sock" MGL_GRAB_KEYS="$KEYS" XDG_RUNTIME_DIR=/run \
+      "$L/mgl-server" "$R/tmp/mgl.sock" -v </dev/null >"$L/mgl.log" 2>&1 &
     echo $! > "$L/mgl.pid"
     for _ in $(seq 25); do [ -S "$R/tmp/mgl.sock" ] && break; sleep 0.2; done
     gl_flags="--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-watchdog"
