@@ -7,15 +7,18 @@
   tools/tvremote key NAME...             press remote keys (see KEYS), e.g. key home right ok
 
 It runs tvremote's agent on the TV over one SSH session (uploaded to /tmp on
-first use; build it with `make -C tvremote`). The screen is the TV's graphics
-plane as the compositor mirrors it: TV pictures on the video plane (antenna,
-HDMI) show as black. Settings: TV_HOST and TV_KEY from ../tv.conf.
+first use; build it with `make -C tvremote`). The screen is rebuilt from the
+compositor's window dump: the TV's menus and apps, while TV pictures on the
+video plane (antenna, HDMI) show as black. Each picture pauses the TV's menus
+for about 1.5 s, so the page takes one after each key press instead of
+streaming. Settings: TV_HOST and TV_KEY from ../tv.conf.
 """
 import hashlib
 import http.server
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
 import sys
@@ -58,6 +61,8 @@ def conf():
 class Agent:
     """The agent on the TV, over one SSH session; restarted if it dies."""
 
+    upload = threading.Lock()  # sessions starting together upload the binary once
+
     def __init__(self):
         self.host, self.keyfile = conf()
         self.lock = threading.Lock()
@@ -70,12 +75,16 @@ class Agent:
         if not os.path.exists(AGENT):
             sys.exit(f"{AGENT} missing: run make -C tvremote")
         want = hashlib.sha256(open(AGENT, "rb").read()).hexdigest()
-        have = self.ssh("sha256sum /tmp/tvremote-agent 2>/dev/null | cut -c1-64", capture_output=True, text=True).stdout.strip()
-        if have != want:
-            with open(AGENT, "rb") as f:
-                self.ssh("cat > /tmp/tvremote-agent.new && chmod 755 /tmp/tvremote-agent.new && mv -f /tmp/tvremote-agent.new /tmp/tvremote-agent",
-                         stdin=f, check=True)
-        self.p = subprocess.Popen(["ssh", "-i", self.keyfile, "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", self.host,
+        with Agent.upload:
+            try:
+                have = self.ssh("sha256sum /tmp/tvremote-agent 2>/dev/null | cut -c1-64", capture_output=True, text=True, timeout=20).stdout.strip()
+            except subprocess.TimeoutExpired:
+                raise OSError("TV not responding (off or in standby?)")
+            if have != want:
+                with open(AGENT, "rb") as f:
+                    self.ssh("cat > /tmp/tvremote-agent.new && chmod 755 /tmp/tvremote-agent.new && mv -f /tmp/tvremote-agent.new /tmp/tvremote-agent",
+                             stdin=f, check=True)
+        self.p = subprocess.Popen(["ssh", "-i", self.keyfile, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", self.host,
                                    "XDG_RUNTIME_DIR=/run exec /tmp/tvremote-agent"],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
@@ -88,25 +97,39 @@ class Agent:
                 try:
                     self.p.stdin.write((line + "\n").encode())
                     self.p.stdin.flush()
-                    head = self.p.stdout.readline().decode().strip()
-                    if not head:
-                        raise OSError("agent closed")
+                    head = self.readline(15).strip()
                     if head.startswith("frame "):
                         n = int(head.split()[1])
                         data = b""
                         while len(data) < n:
-                            chunk = self.p.stdout.read(n - len(data))
+                            self.wait(15)
+                            chunk = os.read(self.p.stdout.fileno(), n - len(data))
                             if not chunk:
                                 raise OSError("agent closed")
                             data += chunk
                         return head, data
                     return head, None
-                except (OSError, ValueError):
+                except (OSError, ValueError, subprocess.CalledProcessError):
                     if self.p:
                         self.p.kill()
                     self.p = None
                     if attempt == 2:
                         raise
+
+    def wait(self, timeout):
+        if not select.select([self.p.stdout.fileno()], [], [], timeout)[0]:
+            raise OSError("TV not responding (off or in standby?)")
+
+    def readline(self, timeout):
+        """One line from the agent, reading the raw fd (no Python buffering)."""
+        out = b""
+        while not out.endswith(b"\n"):
+            self.wait(timeout)
+            c = os.read(self.p.stdout.fileno(), 1)
+            if not c:
+                raise OSError("agent closed")
+            out += c
+        return out.decode()
 
     def frame(self, scale=2):
         head, data = self.call(f"frame {int(scale)}")
@@ -127,7 +150,7 @@ PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>TV remote</title>
 <style>
   :root { color-scheme: dark; }
-  body { margin: 0; background: #101216; color: #dde; font: 14px system-ui, sans-serif; display: flex; gap: 18px; padding: 16px; flex-wrap: wrap; }
+  body { margin: 0; background: #101216; color: #dde; font: 14px system-ui, sans-serif; display: flex; align-items: flex-start; gap: 18px; padding: 16px; flex-wrap: wrap; }
   #screen { width: min(960px, 100%); aspect-ratio: 16/9; background: #000; border-radius: 8px; object-fit: contain; }
   #side { display: flex; flex-direction: column; gap: 10px; min-width: 250px; }
   .grid { display: grid; grid-template-columns: repeat(3, 72px); gap: 6px; }
@@ -135,7 +158,8 @@ PAGE = r"""<!doctype html>
   button:active, button.hit { background: #2d6cdf; }
   .ok { background: #3a4252; font-weight: bold; }
   .red { background: #8b2a2a; } .green { background: #2a7a3a; } .yellow { background: #8a7a1a; } .blue { background: #2a4a8b; }
-  #status { color: #889; font-size: 12px; min-height: 16px; }
+  #status, #shot { color: #889; font-size: 12px; min-height: 16px; }
+  .row { display: flex; gap: 10px; align-items: center; } .row button { padding: 0 14px; }
   .hint { color: #778; font-size: 12px; line-height: 1.5; max-width: 250px; }
   kbd { background: #262b35; border-radius: 4px; padding: 0 4px; }
 </style></head><body>
@@ -155,46 +179,75 @@ PAGE = r"""<!doctype html>
     <button data-k="7">7</button><button data-k="8">8</button><button data-k="9">9</button>
     <button data-k="stop">⏹</button><button data-k="0">0</button><button data-k="pause">⏸</button>
   </div>
-  <div id="status"></div>
+  <div class="row"><button id="refresh">Refresh (R)</button>
+    <label><input type="checkbox" id="auto"> every 10 s</label></div>
+  <div id="status"></div><div id="shot"></div>
   <div class="hint">Keyboard: arrows, <kbd>Enter</kbd> OK, <kbd>Backspace</kbd>/<kbd>Esc</kbd> Back,
     <kbd>H</kbd> Home, <kbd>S</kbd> Source, <kbd>M</kbd> Menu, <kbd>X</kbd> Exit, <kbd>0</kbd>–<kbd>9</kbd>,
     <kbd>F1</kbd>–<kbd>F4</kbd> A–D, <kbd>+</kbd>/<kbd>−</kbd> volume, <kbd>PgUp</kbd>/<kbd>PgDn</kbd> channel.
-    The TV picture itself (antenna, HDMI) shows as black: only the TV's graphics are mirrored.</div>
+    The picture updates after each key press (each one pauses the TV's menus for about 1.5 s,
+    so it doesn't stream). TV pictures (antenna, HDMI) show as black: only the TV's own graphics are captured.
+    If everything is black and no keys work, the TV may be off or in standby.</div>
 </div>
 <script>
-const st = document.getElementById('status'), img = document.getElementById('screen');
+const st = document.getElementById('status'), shotSt = document.getElementById('shot'), img = document.getElementById('screen');
+const auto = document.getElementById('auto');
+// Pictures are taken on demand: shortly after the last key press, once more
+// when animations have settled, on Refresh, and (if ticked) every 10 s. Never
+// while this tab is hidden.
+let timer = 0, busy = false, again = false, followUp = false;
+function schedule(ms) { clearTimeout(timer); timer = setTimeout(shot, ms); }
 async function press(k, el) {
   if (el) { el.classList.add('hit'); setTimeout(() => el.classList.remove('hit'), 150); }
   const r = await fetch('/key/' + k, { method: 'POST' });
   st.textContent = r.ok ? 'sent ' + k : 'error: ' + await r.text();
+  followUp = true;
+  schedule(700);
 }
 document.querySelectorAll('button[data-k]').forEach((b) => b.onclick = () => press(b.dataset.k, b));
+document.getElementById('refresh').onclick = () => schedule(0);
+auto.onchange = () => { if (auto.checked) schedule(0); };
 const map = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Enter: 'ok', Backspace: 'back',
   Escape: 'back', h: 'home', s: 'source', m: 'menu', x: 'exit', i: 'info', F1: 'red', F2: 'green', F3: 'yellow', F4: 'blue',
   '+': 'volup', '=': 'volup', '-': 'voldown', PageUp: 'chup', PageDown: 'chdown', ' ': 'play' };
 addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === 'r') { e.preventDefault(); schedule(0); return; }
   const k = /^[0-9]$/.test(e.key) ? e.key : map[e.key];
-  if (!k || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (!k) return;
   e.preventDefault();
   press(k, document.querySelector(`button[data-k="${k}"]`));
 });
-let last = 0;
-async function loop() {
-  const t = Date.now();
+async function shot() {
+  clearTimeout(timer);
+  if (document.hidden) return;
+  if (busy) { again = true; return; }
+  busy = true;
+  shotSt.textContent = 'taking a picture…';
+  const t0 = performance.now();
   try {
-    const r = await fetch('/frame.jpg?t=' + t);
-    if (r.ok) { const u = URL.createObjectURL(await r.blob()); const old = img.src; img.src = u; if (old.startsWith('blob:')) URL.revokeObjectURL(old); }
-    else st.textContent = 'screen: ' + await r.text();
-  } catch (e) { st.textContent = 'screen: ' + e; }
-  setTimeout(loop, Math.max(0, 150 - (Date.now() - t)));
+    const r = await fetch('/frame.jpg?t=' + Date.now());
+    if (r.ok) {
+      const u = URL.createObjectURL(await r.blob()), old = img.src;
+      img.src = u;
+      if (old.startsWith('blob:')) URL.revokeObjectURL(old);
+      shotSt.textContent = `picture from ${new Date().toLocaleTimeString()} (${((performance.now() - t0) / 1000).toFixed(1)} s)`;
+    } else shotSt.textContent = 'screen: ' + await r.text();
+  } catch (e) { shotSt.textContent = 'screen: ' + e; }
+  busy = false;
+  if (again) { again = false; schedule(0); }
+  else if (followUp) { followUp = false; schedule(2500); }
+  else if (auto.checked) schedule(10000);
 }
-loop();
+document.addEventListener('visibilitychange', () => { if (!document.hidden) schedule(0); });
+shot();
 </script></body></html>
 """
 
 
 def serve(port):
-    agent = Agent()
+    # Separate sessions so that key presses never wait for a picture.
+    screen, remote = Agent(), Agent()
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -215,7 +268,7 @@ def serve(port):
             if u.path == "/frame.jpg":
                 scale = urllib.parse.parse_qs(u.query).get("scale", ["2"])[0]
                 try:
-                    return self.send(200, agent.frame(int(scale)), "image/jpeg")
+                    return self.send(200, screen.frame(int(scale)), "image/jpeg")
                 except Exception as e:
                     return self.send(503, str(e).encode())
             if u.path == "/keys":
@@ -229,7 +282,7 @@ def serve(port):
             if not m:
                 return self.send(404, b"not found")
             try:
-                agent.key(m.group(1))
+                remote.key(m.group(1))
                 self.send(200, b"ok")
             except KeyError:
                 self.send(400, b"unknown key")

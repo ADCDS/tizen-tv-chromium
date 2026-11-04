@@ -156,7 +156,7 @@ the video frame rate.
 | `tvkioskd/` | helper on the TV: opens apps (one tab each), hides/shows the kiosk, starts it on demand, Internet takeover, start page |
 | `kiosk/tvkit/` | Chromium extension: on-screen keyboard, browser bar, Back handling, pointer cursor |
 | `tiles/` | TV app tiles that open the configured apps (template, build, install) |
-| `tvremote/`, `tools/tvremote` | see and drive the TV from a PC: live screen + remote control in a browser page |
+| `tvremote/`, `tools/tvremote` | see and drive the TV from a PC: screen pictures + remote control in a browser page |
 | `tools/` | `tvshot` (screenshot of a TV window), `tvkey` (press remote keys), `cdp.mjs` (DevTools) |
 
 ## Debugging
@@ -167,10 +167,11 @@ the video frame rate.
   own window dump, and prints the window stack.
 - `tools/tvkey down down enter` presses remote keys, the same path as a real press.
 - `tools/tvremote` (after `make -C tvremote`) serves http://localhost:8790: the TV's
-  screen, refreshed continuously, and a remote control (buttons and keyboard). It
-  captures through the compositor's screen mirror, with hardware overlay planes
-  switched off while it runs; `tvremote shot FILE` and `tvremote key NAME...` do the
-  same from the command line.
+  screen and a remote control (buttons and keyboard). The picture is rebuilt from
+  the compositor's window dump and updates after each key press, on Refresh, or
+  every 10 s if ticked. It doesn't stream: each picture pauses the TV's menus for
+  about 1.5 s. `tvremote shot FILE` and `tvremote key NAME...` do the same from the
+  command line.
 - `MGL_CHECK=1 ./kiosk/kiosk start` logs every GL call that raises an error.
   `MGL_TRACE=/tmp/kiosk/log/trace.txt` logs every call. See [mgl/README.md](mgl/README.md).
 
@@ -186,6 +187,13 @@ Things that cost time to find out on this TV:
 - The Mali-450 has no `highp` in fragment shaders and no vertex texture units.
   `mgl` papers over both.
 - USB storage is mounted `noexec`, so binaries are copied to tmpfs before they run.
+- Don't use the compositor's capture interfaces (`tizen_screenmirror`, `screenshooter`)
+  for repeated captures. Into a shared-memory buffer, each frame leaks one or two
+  full-screen graphics buffers (8 MB each), even after the client disconnects, and
+  the TV reboots once memory runs out (about 40 frames). Into a DRM dumb buffer
+  shared through `wl_tbm`, the first capture reboots the TV. The window dump
+  (`enlightenment_info -dump_topvwins`) frees everything, but it blocks the
+  compositor while it runs.
 - The TV mounts USB ext4 without write barriers. A power cut while Chromium
   writes its profile can corrupt the filesystem, and with a corrupt block bitmap
   new writes can land on the image. If `kiosk install` keeps re-copying an

@@ -6,13 +6,12 @@
 //	key <code>       press and release a remote key (evdev code)
 //	down <code>      press a key; up <code> releases it
 //
-// Errors are answered with "err <message>\n". The screen comes from the
-// compositor's own mirror (tizen_screenshooter / tizen_screenmirror): what the
-// graphics plane shows, so TV pictures on the video plane (antenna, HDMI)
-// appear black. The mirror only sees composited windows, so while the agent
-// captures, the compositor's hardware overlay planes are switched off
-// (enlightenment_info -hwc 0) and back on when the agent exits. Keys are
-// written to the remote control's input device, the same path as real presses.
+// Errors are answered with "err <message>\n". The screen is rebuilt from the
+// compositor's window dump (capture.go): what the graphics plane shows, so TV
+// pictures on the video plane (antenna, HDMI) appear black. Each frame pauses
+// the compositor for about 1.5 s, so frames are meant to be taken on demand
+// (after key presses), not streamed. Keys are written to the remote control's
+// input device, the same path as real presses.
 package main
 
 import (
@@ -23,11 +22,8 @@ import (
 	"image"
 	"image/jpeg"
 	"os"
-	"os/exec"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -36,13 +32,8 @@ var le = binary.LittleEndian
 const rcDevice = "/dev/input/event0" // the remote control's input device
 
 func main() {
-	defer hwc(true)
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	go func() { <-sig; hwc(true); os.Exit(0) }()
 	in := bufio.NewScanner(os.Stdin)
 	out := bufio.NewWriter(os.Stdout)
-	var s *screen
 	reply := func(format string, a ...any) { fmt.Fprintf(out, format+"\n", a...); out.Flush() }
 	for in.Scan() {
 		f := strings.Fields(in.Text())
@@ -51,23 +42,19 @@ func main() {
 		}
 		switch f[0] {
 		case "frame":
+			if up := uptime(); up >= 0 && up < 90*time.Second {
+				// Booting: memory is tight and the TV's UI is starting; capturing
+				// can wait.
+				reply("err TV is starting up (%ds since boot)", int(up.Seconds()))
+				continue
+			}
 			scale := 2
 			if len(f) > 1 {
 				scale, _ = strconv.Atoi(f[1])
 			}
-			if s == nil {
-				hwc(false)
-				var err error
-				if s, err = openScreen(); err != nil {
-					reply("err %v", err)
-					continue
-				}
-			}
-			jpg, err := s.capture(scale)
+			jpg, err := capture(scale)
 			if err != nil {
 				reply("err %v", err)
-				s.close()
-				s = nil
 				continue
 			}
 			reply("frame %d", len(jpg))
@@ -127,52 +114,16 @@ func press(code uint16, how string) error {
 	return write(0)
 }
 
-// downscale turns the captured ARGB8888 (little-endian: B, G, R, A) buffer
-// into an RGB image n times smaller, averaging n x n blocks. Fully
-// transparent pixels (where the video plane shows through) come out black.
-func downscale(pix []byte, w, h, stride, n int) *image.RGBA {
-	if n < 1 {
-		n = 1
+func uptime() time.Duration {
+	b, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return -1
 	}
-	ow, oh := w/n, h/n
-	img := image.NewRGBA(image.Rect(0, 0, ow, oh))
-	for y := 0; y < oh; y++ {
-		for x := 0; x < ow; x++ {
-			var r, g, b int
-			for dy := 0; dy < n; dy++ {
-				row := pix[(y*n+dy)*stride:]
-				for dx := 0; dx < n; dx++ {
-					p := row[(x*n+dx)*4:]
-					a := int(p[3])
-					b += int(p[0]) * a / 255
-					g += int(p[1]) * a / 255
-					r += int(p[2]) * a / 255
-				}
-			}
-			d := n * n
-			o := img.PixOffset(x, y)
-			img.Pix[o], img.Pix[o+1], img.Pix[o+2], img.Pix[o+3] = byte(r/d), byte(g/d), byte(b/d), 255
-		}
+	var secs float64
+	if _, err := fmt.Sscanf(string(b), "%f", &secs); err != nil {
+		return -1
 	}
-	return img
-}
-
-// hwc switches the compositor's hardware overlay planes on or off.
-var hwcOff bool
-
-func hwc(on bool) {
-	if on == !hwcOff {
-		return
-	}
-	arg := "0"
-	if on {
-		arg = "1"
-	}
-	cmd := exec.Command("enlightenment_info", "-hwc", arg)
-	cmd.Env = append(os.Environ(), "XDG_RUNTIME_DIR=/run")
-	if cmd.Run() == nil {
-		hwcOff = !on
-	}
+	return time.Duration(secs * float64(time.Second))
 }
 
 func encode(img image.Image) ([]byte, error) {
